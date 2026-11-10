@@ -1,0 +1,128 @@
+#!/bin/bash
+# minitv-red: red wifi propia de la Mini TV.
+# Al encender: si la red de casa (las de /etc/wpa_supplicant/wpa_supplicant.conf) no está a la vista,
+# la TV crea su propia red (SSID y clave en /etc/minitv/red-propia.conf) para usar el control remoto
+# desde el teléfono sin internet. En casa no hace nada: wifi y SSH como siempre.
+# Mientras usa la red propia, cada 3 minutos sin ningún teléfono conectado vuelve a probar la red de
+# casa (por si el router tardó en arrancar después de un corte de luz).
+#
+# Uso:  minitv-red                 (lo lanza minitv-red.service al arrancar)
+#       minitv-red prueba [SEG]    red propia durante SEG segundos (90) y vuelve a casa
+# Estado: /run/minitv-red/modo  ("buscando", "casa" o "propia")
+set -u
+CONF=/etc/minitv/red-propia.conf
+SSID=MiniTV; CLAVE=miray2000; IP=192.168.4.1; PAIS=PE
+[ -r "$CONF" ] && . "$CONF"
+EST=/run/minitv-red
+mkdir -p "$EST"; chmod 755 "$EST"
+WPA="/sbin/wpa_cli -i wlan0"
+log() { echo "minitv-red: $*"; }
+modo() { echo "$1" > "$EST/modo"; }
+
+conocidas() { grep -oP '^\s*ssid="\K[^"]+' /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null; }
+en_casa() { $WPA status 2>/dev/null | grep -q '^wpa_state=COMPLETED'; }
+casa_visible() {
+    local c; c=$(conocidas); [ -n "$c" ] || return 1
+    $WPA scan_results 2>/dev/null | awk -F'\t' 'NR > 1 { print $5 }' | grep -qxF "$c"
+}
+
+# Espera la red de casa. 0 = conectada. Si en ~5 s el escaneo no la ve, se rinde enseguida
+# (así la red propia aparece pronto); si la ve, le da hasta $1 segundos para conectarse.
+esperar_casa() {
+    local fin=$((SECONDS + $1)) corto=$((SECONDS + 3)) escaneos=0
+    while [ $SECONDS -lt $fin ]; do
+        en_casa && return 0
+        if [ $SECONDS -ge $corto ] && ! casa_visible; then
+            escaneos=$((escaneos + 1))
+            [ $escaneos -ge 3 ] && return 1
+            [ $escaneos = 1 ] && $WPA scan >/dev/null 2>&1
+        fi
+        sleep 1
+    done
+    en_casa
+}
+
+iniciar_propia() {
+    log "sin red de casa: creando la red \"$SSID\" ($IP)"
+    /sbin/dhcpcd -x wlan0 >/dev/null 2>&1          # dhcpcd suelta wlan0 (y para su wpa_supplicant)
+    sleep 0.5
+    $WPA terminate >/dev/null 2>&1
+    pkill -f 'wpa_supplicant.*-iwlan0' 2>/dev/null
+    for i in $(seq 25); do pgrep -f 'wpa_supplicant.*-iwlan0' >/dev/null || break; sleep 0.2; done
+    pgrep -af wpa_supplicant > "$EST/antes-de-hostapd.txt" 2>&1
+    /sbin/ip addr flush dev wlan0
+    /sbin/ip link set wlan0 down
+    /sbin/iw dev wlan0 set type __ap 2>>"$EST/antes-de-hostapd.txt"
+    /sbin/ip link set wlan0 up
+    /sbin/ip addr add "$IP/24" dev wlan0
+    cat > "$EST/hostapd.conf" <<CONF
+interface=wlan0
+driver=nl80211
+ssid=$SSID
+country_code=$PAIS
+hw_mode=g
+channel=6
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$CLAVE
+CONF
+    chmod 600 "$EST/hostapd.conf"
+    /usr/sbin/hostapd -B -P "$EST/hostapd.pid" "$EST/hostapd.conf" | grep -v "^Configuration file"
+    local red=${IP%.*}
+    # DHCP para los teléfonos, sin puerta de enlace (no hay internet: el teléfono sigue usando sus
+    # datos móviles para lo demás). minitv.local y minitv apuntan a la TV.
+    /usr/sbin/dnsmasq --conf-file=/dev/null --interface=wlan0 --bind-interfaces --except-interface=lo \
+        --dhcp-range="$red.10,$red.60,255.255.255.0,12h" --dhcp-option=3 --dhcp-option=6,"$IP" \
+        --address=/minitv.local/"$IP" --address=/minitv/"$IP" --no-resolv --no-hosts \
+        --dhcp-leasefile="$EST/dnsmasq.leases" --pid-file="$EST/dnsmasq.pid"
+    modo propia
+}
+
+parar_propia() {
+    [ -f "$EST/hostapd.pid" ] && kill "$(cat "$EST/hostapd.pid")" 2>/dev/null
+    [ -f "$EST/dnsmasq.pid" ] && kill "$(cat "$EST/dnsmasq.pid")" 2>/dev/null
+    rm -f "$EST/hostapd.pid" "$EST/dnsmasq.pid"
+    sleep 0.5
+    /sbin/ip addr flush dev wlan0
+}
+
+volver_casa() {   # 0 si se conectó a la red de casa
+    log "probando la red de casa"
+    parar_propia
+    modo buscando
+    systemctl restart dhcpcd                       # vuelve a manejar wlan0 con su wpa_supplicant
+    sleep 3
+    if esperar_casa 25; then log "conectada a la red de casa"; modo casa; return 0; fi
+    return 1
+}
+
+telefonos() { /sbin/iw dev wlan0 station dump 2>/dev/null | grep -c '^Station'; }
+
+trap '[ "$(cat "$EST/modo" 2>/dev/null)" = propia ] && { parar_propia; systemctl restart dhcpcd; }; exit 0' TERM INT
+
+if [ "${1:-}" = "prueba" ]; then
+    iniciar_propia
+    sleep 8; /sbin/iw dev wlan0 info > "$EST/prueba-iw.txt" 2>&1
+    sleep "${2:-90}" & wait $!
+    volver_casa || volver_casa
+    exit 0
+fi
+
+modo buscando
+for i in $(seq 40); do [ -S /run/wpa_supplicant/wlan0 ] && break; sleep 0.1; done
+if esperar_casa 30; then
+    log "conectada a la red de casa"; modo casa
+    exec sleep infinity                            # nada más que hacer (el servicio queda activo)
+fi
+iniciar_propia
+while true; do
+    sleep 180 & wait $!
+    if [ "$(telefonos)" = 0 ]; then
+        volver_casa && exec sleep infinity
+        iniciar_propia
+    fi
+done

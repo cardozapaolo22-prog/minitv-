@@ -1,0 +1,12 @@
+[Unit]
+Description=MiniTV: red wifi propia si no está la red de casa
+After=dhcpcd.service
+Wants=dhcpcd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/minitv-red
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

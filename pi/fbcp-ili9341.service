@@ -1,0 +1,15 @@
+[Unit]
+Description=fbcp-ili9341: copia el framebuffer HDMI a la pantalla SPI ILI9341
+# Arranca en cuanto empieza systemd: solo necesita su binario (ya en la raíz montada
+# por el kernel), /dev/mem y /dev/vchiq. Se detiene al apagar, después de la mini TV.
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=sysinit.target shutdown.target
+
+[Service]
+ExecStart=/usr/local/bin/fbcp-ili9341
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,29 @@
+# Configuración de MiniTV (/etc/default/minitv).
+# Después de editar:  sudo systemctl restart minitv
+
+# Carpeta con las series: una subcarpeta por canal, "NN Nombre" (p. ej. "02 Los Simpson")
+VIDEO_DIR=/home/paolo/videos
+
+# Si nadie toca nada en el menú durante estos segundos, se reanuda la última serie
+MENU_REANUDAR_SEG=10
+
+# Botones y encoder (BCM). Se activarán cuando confirmes el cableado.
+BOTON1_GPIO=3         # pin 5 (GND pin 9): menú (corto) / apagar (2 s) — también enciende la Pi
+BOTON2_GPIO=16        # pin 36 (GND pin 34): bajar (corto) / elegir (mantenido 0,8 s)
+#ENCODER_CLK_GPIO=5   # pin 29
+#ENCODER_DT_GPIO=6    # pin 31
+#ENCODER_SW_GPIO=26   # pin 37  (GND pin 39, "+" a 3,3 V pin 17)
+
+# Audio: PWM por GPIO18 -> PAM8403, mezclado a mono por /etc/asound.conf.
+# Volumen máximo: lo aplica VLC con AUDIO_GAIN (el mezclador PCM queda en 0 dB, su valor
+# de arranque, para no depender de cuándo se restaura ALSA).
+#   0.25 = -12 dB   0.35 = -9 dB   0.5 = -6 dB (actual, desde 2026-11-07)   1.0 = 0 dB (máximo)
+# Se aplica igual a los episodios (VLC) y a los juegos (RetroArch).
+# Para silenciar: AUDIO=no
+AUDIO=yes
+AUDIO_DEVICE=minitv_mono
+AUDIO_GAIN=0.5
+
+# Juegos: consolas que se agrandan a toda la pantalla (escala no entera, sin deformar) en vez de
+# verse a 1x con bordes negros. Ejemplo: gba = 240x160 -> 320x213. Separadas por espacios.
+JUEGOS_AJUSTAR=gba

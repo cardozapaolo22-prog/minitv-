@@ -1,0 +1,17 @@
+[Unit]
+Description=MiniTV: radio estable (WiFi sin ahorro de energía, mandos Bluetooth sin modo sniff)
+# El chip de la Pi Zero 2 W comparte antena entre WiFi (2,4 GHz) y Bluetooth.
+After=bluetooth.service hciuart.service sys-subsystem-net-devices-wlan0.device
+Wants=bluetooth.service
+PartOf=bluetooth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# WiFi: el ahorro de energía corta la conexión (respaldos y subidas que se caen)
+ExecStart=-/sbin/iw dev wlan0 set power_save off
+# Bluetooth: sin SNIFF (ahorro de energía del enlace que agrega latencia y cortes a los mandos)
+ExecStart=-/usr/bin/hciconfig hci0 lp RSWITCH
+
+[Install]
+WantedBy=multi-user.target bluetooth.service

@@ -1,0 +1,48 @@
+diff --git a/gfx/drivers/dispmanx_gfx.c b/gfx/drivers/dispmanx_gfx.c
+index badcebe..642769a 100644
+--- a/gfx/drivers/dispmanx_gfx.c
++++ b/gfx/drivers/dispmanx_gfx.c
+@@ -28,6 +28,7 @@
+ 
+ #include "../../driver.h"
+ #include "../../retroarch.h"
++#include "../../configuration.h"
+ 
+ struct dispmanx_page
+ {
+@@ -275,10 +276,32 @@ static void dispmanx_surface_setup(struct dispmanx_video *_dispvars,
+    dst_width  = _dispvars->dispmanx_height * aspect;
+    dst_height = _dispvars->dispmanx_height;
+ 
+-   /* If we obtain a scaled image width that is bigger than the physical screen width,
+-    * then we keep the physical screen width as our maximum width. */
++   /* MiniTV: keep the aspect ratio when the width does not fit
++    * (instead of squashing it to the screen width). */
+    if (dst_width > _dispvars->dispmanx_width)
+-      dst_width = _dispvars->dispmanx_width;
++   {
++      dst_width  = _dispvars->dispmanx_width;
++      if (layer >= 0)
++         dst_height = _dispvars->dispmanx_width / aspect;
++   }
++
++   /* MiniTV: integer scaling (square pixels, centred) for the game and menu
++    * surfaces when video_scale_integer is enabled and at least 1x fits. */
++   if (layer >= 0)
++   {
++      settings_t *settings = config_get_ptr();
++      if (settings && settings->bools.video_scale_integer)
++      {
++         int fx = _dispvars->dispmanx_width  / src_width;
++         int fy = _dispvars->dispmanx_height / src_height;
++         int f  = fx < fy ? fx : fy;
++         if (f >= 1)
++         {
++            dst_width  = src_width  * f;
++            dst_height = src_height * f;
++         }
++      }
++   }
+ 
+    dst_xpos = (_dispvars->dispmanx_width - dst_width) / 2;
+    dst_ypos = (_dispvars->dispmanx_height - dst_height) / 2;

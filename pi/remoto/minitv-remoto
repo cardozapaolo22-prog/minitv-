@@ -1,0 +1,266 @@
+#!/usr/bin/python3
+"""minitv-remoto: control remoto web de la Mini TV y mando virtual para los juegos.
+
+Página: http://minitv.local (en casa) o http://192.168.4.1 (red propia "MiniTV", ver minitv-red).
+Sin internet: todo sale de la TV (/usr/local/share/minitv/remoto).
+
+El teléfono habla con este servidor por un WebSocket (/ws), mensajes de texto cortos:
+  o:ORDEN   una orden del control (sube, baja, ok, atras, inicio, pausa, stop, vol+, vol-,
+            encendido, izquierda, derecha) -> /run/minitv/control.sock (la atiende minitv)
+  h         "¿sigues ahí?" cada 1,5 s; respuesta  e:{estado de la TV}  (de /run/minitv/remoto.json)
+  m:on      modo mando: crea un mando virtual (uinput) para este teléfono; respuesta  j:N  (jugador)
+  m:off     deja el modo mando (el mando virtual desaparece)
+  p:N       botones apretados del mando (máscara de bits, ver BITS)
+Cada teléfono en modo mando es un mando distinto: dos teléfonos = jugador 1 y jugador 2. RetroArch
+los reconoce con el perfil "MiniTV Mando.cfg" (autoconfig/udev).
+Solo biblioteca estándar de Python + python3-evdev.
+"""
+import base64
+import hashlib
+import json
+import os
+import socket
+import struct
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WEB = "/usr/local/share/minitv/remoto"
+SOCK_CONTROL = "/run/minitv/control.sock"
+ESTADO = "/run/minitv/remoto.json"
+PUERTO = int(os.environ.get("MINITV_REMOTO_PUERTO", "80"))
+ORDENES = {"sube", "baja", "izquierda", "derecha", "ok", "atras", "inicio", "pausa", "stop",
+           "vol+", "vol-", "encendido"}
+TIPOS = {".html": "text/html; charset=utf-8", ".webmanifest": "application/manifest+json",
+         ".png": "image/png", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+GUID_WS = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_JUGADORES = 4
+
+
+def log(*a):
+    print("minitv-remoto:", *a, flush=True)
+
+
+# ----- órdenes a la TV -----
+_control = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+
+
+def enviar(orden):
+    try:
+        _control.sendto(orden.encode(), SOCK_CONTROL)
+    except OSError as e:
+        log(f"no se pudo enviar '{orden}' ({e})")
+
+
+def estado_tv():
+    try:
+        with open(ESTADO, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"modo": "sin_tv"}
+
+
+# ----- mandos virtuales (uinput) -----
+try:
+    import evdev
+    from evdev import ecodes as e
+    # Bit de la máscara -> botón. RetroArch (udev) numera los botones por código: B=0 A=1 X=2 Y=3
+    # L=4 R=5 Select=6 Start=7; la cruceta va como "hat" (h0up...). Ver "MiniTV Mando.cfg".
+    BITS = [e.BTN_SOUTH, e.BTN_EAST, e.BTN_NORTH, e.BTN_WEST, e.BTN_TL, e.BTN_TR, e.BTN_SELECT, e.BTN_START]
+    ARRIBA, ABAJO, IZQUIERDA, DERECHA = 1 << 8, 1 << 9, 1 << 10, 1 << 11
+except ImportError:
+    evdev = None
+
+_jugadores = {}            # número -> Mando
+_candado = threading.Lock()
+
+
+class Mando:
+    def __init__(self, numero):
+        self.numero = numero
+        caps = {e.EV_KEY: BITS,
+                e.EV_ABS: [(e.ABS_HAT0X, evdev.AbsInfo(0, -1, 1, 0, 0, 0)),
+                           (e.ABS_HAT0Y, evdev.AbsInfo(0, -1, 1, 0, 0, 0))]}
+        self.ui = evdev.UInput(caps, name="MiniTV Mando", vendor=0x1209, product=0x4D54, version=1,
+                               bustype=e.BUS_VIRTUAL)
+        self.mascara = 0
+
+    def poner(self, mascara):
+        cambio = mascara ^ self.mascara
+        if not cambio:
+            return
+        for i, codigo in enumerate(BITS):
+            if cambio & (1 << i):
+                self.ui.write(e.EV_KEY, codigo, 1 if mascara & (1 << i) else 0)
+        if cambio & (IZQUIERDA | DERECHA):
+            self.ui.write(e.EV_ABS, e.ABS_HAT0X, (1 if mascara & DERECHA else 0) - (1 if mascara & IZQUIERDA else 0))
+        if cambio & (ARRIBA | ABAJO):
+            self.ui.write(e.EV_ABS, e.ABS_HAT0Y, (1 if mascara & ABAJO else 0) - (1 if mascara & ARRIBA else 0))
+        self.ui.syn()
+        self.mascara = mascara
+
+    def cerrar(self):
+        try:
+            self.poner(0)
+            self.ui.close()
+        except OSError:
+            pass
+
+
+def nuevo_mando():
+    if evdev is None:
+        return None
+    with _candado:
+        libre = next((n for n in range(1, MAX_JUGADORES + 1) if n not in _jugadores), None)
+        if libre is None:
+            return None
+        try:
+            _jugadores[libre] = Mando(libre)
+        except OSError as err:
+            log(f"no se pudo crear el mando virtual: {err}")
+            return None
+        log(f"mando virtual del jugador {libre} conectado")
+        return _jugadores[libre]
+
+
+def quitar_mando(m):
+    if m:
+        with _candado:
+            _jugadores.pop(m.numero, None)
+        m.cerrar()
+        log(f"mando virtual del jugador {m.numero} desconectado")
+
+
+# ----- WebSocket mínimo (RFC 6455: texto, ping, cierre) -----
+class WebSocket:
+    def __init__(self, conexion, lector):
+        self.c, self.r = conexion, lector
+        self.envio = threading.Lock()
+
+    def recibir(self):
+        """Texto del siguiente mensaje, o None si se cerró."""
+        while True:
+            cab = self.r.read(2)
+            if len(cab) < 2:
+                return None
+            op, n = cab[0] & 0x0F, cab[1] & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self.r.read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self.r.read(8))[0]
+            if n > 65536:
+                return None
+            mascara = self.r.read(4) if cab[1] & 0x80 else b"\0\0\0\0"
+            datos = bytearray(self.r.read(n))
+            if len(datos) < n:
+                return None
+            for i in range(n):
+                datos[i] ^= mascara[i & 3]
+            if op == 8:                                   # cierre
+                return None
+            if op == 9:                                   # ping -> pong
+                self._marco(10, bytes(datos))
+                continue
+            if op in (1, 2):
+                return datos.decode("utf-8", "replace")
+
+    def _marco(self, op, datos):
+        n = len(datos)
+        cab = bytes([0x80 | op]) + (bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n))
+        with self.envio:
+            self.c.sendall(cab + datos)
+
+    def enviar(self, texto):
+        self._marco(1, texto.encode("utf-8"))
+
+
+class Manejador(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "MiniTV"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        ruta = self.path.split("?", 1)[0]
+        if ruta == "/ws" and "websocket" in self.headers.get("Upgrade", "").lower():
+            return self._websocket()
+        if ruta == "/estado":
+            return self._responder(200, json.dumps(estado_tv()).encode(), "application/json")
+        nombre = "index.html" if ruta in ("/", "") else os.path.basename(ruta)
+        archivo = os.path.join(WEB, nombre)
+        tipo = TIPOS.get(os.path.splitext(nombre)[1])
+        if not tipo or not os.path.isfile(archivo):
+            return self._responder(404, b"No existe", "text/plain; charset=utf-8")
+        with open(archivo, "rb") as f:
+            self._responder(200, f.read(), tipo)
+
+    def _responder(self, codigo, cuerpo, tipo):
+        self.send_response(codigo)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+    def _websocket(self):
+        clave = self.headers.get("Sec-WebSocket-Key", "")
+        acepta = base64.b64encode(hashlib.sha1((clave + GUID_WS).encode()).digest()).decode()
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", acepta)
+        self.end_headers()
+        self.wfile.flush()
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # sin esperas: latencia
+        self.connection.settimeout(30)                    # el teléfono manda "h" cada 1,5 s
+        ws = WebSocket(self.connection, self.rfile)
+        mando = None
+        try:
+            while True:
+                msj = ws.recibir()
+                if msj is None:
+                    break
+                if msj.startswith("p:") and mando:
+                    try:
+                        mando.poner(int(msj[2:]) & 0xFFF)
+                    except ValueError:
+                        pass
+                elif msj == "h":
+                    ws.enviar("e:" + json.dumps(estado_tv(), ensure_ascii=False))
+                elif msj.startswith("o:"):
+                    if msj[2:] in ORDENES:
+                        enviar(msj[2:])
+                elif msj == "m:on":
+                    if not mando:
+                        mando = nuevo_mando()
+                    ws.enviar(f"j:{mando.numero if mando else 0}")
+                elif msj == "m:off":
+                    quitar_mando(mando)
+                    mando = None
+        except (OSError, socket.timeout):
+            pass
+        finally:
+            quitar_mando(mando)
+        self.close_connection = True
+
+
+class Servidor(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    srv = Servidor(("", PUERTO), Manejador)
+    log(f"escuchando en el puerto {PUERTO}" + ("" if evdev else " (sin python3-evdev: no hay modo mando)"))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    for m in list(_jugadores.values()):
+        quitar_mando(m)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

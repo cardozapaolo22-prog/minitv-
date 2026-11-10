@@ -1,0 +1,114 @@
+#!/bin/bash
+# MiniTV: encendido tipo tubo que se abre a estática ("sintonizando") y luego reproducción
+# aleatoria en bucle de VIDEO_DIR. La estática va en una capa ENCIMA de VLC y solo se retira
+# cuando VLC ya muestra imagen (minitv-vigia): nunca se ve negro entre medias.
+# Si no hay videos o VLC falla, muestra "SIN SEÑAL" en vez de texto.
+# La imagen sale por la capa de video del firmware (MMAL) y fbcp-ili9341 la copia
+# a la pantalla SPI. Configuración en /etc/default/minitv.
+set -u
+
+VIDEO_DIR=/home/paolo/videos
+AUDIO=no
+AUDIO_DEVICE=default
+AUDIO_GAIN=1.0
+PANTALLAS=/usr/local/share/minitv
+CONF="${MINITV_CONF:-/etc/default/minitv}"   # MINITV_CONF permite probar con otra configuración
+[ -r "$CONF" ] && . "$CONF"
+
+ESTATICA=/usr/local/bin/minitv-estatica      # capa de estática encima de VLC
+VIGIA=/usr/local/bin/minitv-vigia            # la oculta cuando VLC ya muestra imagen
+SIN_SENAL="$PANTALLAS/sin-senal.mp4"
+SOCK="/tmp/minitv-vlc-$$.sock"               # control de VLC para el vigía
+EXT_RE='\.(mp4|m4v|mov|mkv)$'
+EST_PID=""
+
+hay_videos() { find "$VIDEO_DIR" -type f 2>/dev/null | grep -qiE "$EXT_RE"; }
+
+# Opciones comunes de VLC
+base=(
+    --intf dummy                    # sin interfaz
+    --fullscreen --no-osd --no-video-title-show
+    --vout mmal_vout                # salida por la capa de video del firmware
+    --no-mmal-adjust-refreshrate    # NO cambiar el modo HDMI 320x240
+    --codec mmal,any
+)
+if [ "$AUDIO" = "yes" ]; then
+    audio=(--aout alsa --alsa-audio-device "$AUDIO_DEVICE" --gain "$AUDIO_GAIN")
+else
+    audio=(--no-audio)
+fi
+
+# Lanza VLC en segundo plano (con control rc si hay estática) y su vigía.
+# Deja los PID en VLC_PID y VIG_PID.
+lanzar_vlc() {
+    VIG_PID=""
+    if [ -n "$EST_PID" ]; then
+        rm -f "$SOCK"
+        cvlc "${base[@]}" --extraintf oldrc --rc-unix "$SOCK" --rc-fake-tty "$@" &
+        VLC_PID=$!
+        "$VIGIA" "$SOCK" "$EST_PID" &
+        VIG_PID=$!
+    else
+        cvlc "${base[@]}" "$@" &
+        VLC_PID=$!
+    fi
+}
+
+# Tras cerrar VLC: parar el vigía y dejar la estática encima (nunca negro).
+cerrar_vlc() {
+    kill "$VLC_PID" 2>/dev/null; wait "$VLC_PID" 2>/dev/null
+    [ -n "$VIG_PID" ] && { kill "$VIG_PID" 2>/dev/null; wait "$VIG_PID" 2>/dev/null; }
+    [ -n "$EST_PID" ] && kill -USR2 "$EST_PID" 2>/dev/null
+    rm -f "$SOCK"
+}
+
+# Muestra "SIN SEÑAL" en bucle hasta que haya videos (revisa cada 5 s),
+# o durante $1 segundos si se indica.
+sin_senal() {
+    local max="${1:-0}" t=0
+    if [ ! -r "$SIN_SENAL" ]; then
+        if [ "$max" -gt 0 ]; then sleep "$max"; else sleep 5; fi
+        return
+    fi
+    lanzar_vlc --no-audio --loop "$SIN_SENAL" >/dev/null 2>&1
+    while kill -0 "$VLC_PID" 2>/dev/null; do
+        sleep 5; t=$((t + 5))
+        if { [ "$max" -gt 0 ] && [ "$t" -ge "$max" ]; } || { [ "$max" -eq 0 ] && hay_videos; }; then
+            break
+        fi
+    done
+    cerrar_vlc
+}
+
+trap 'kill $(jobs -p) 2>/dev/null; wait; rm -f "$SOCK"; exit 0' TERM INT
+
+mkdir -p "$VIDEO_DIR"
+
+# Encendido: tubo que se abre a estática; la estática sigue encima hasta que VLC tenga imagen
+if [ -x "$ESTATICA" ] && [ -x "$VIGIA" ]; then
+    echo "Encendido: tubo y estática"
+    "$ESTATICA" encendido &
+    EST_PID=$!
+fi
+
+while true; do
+    if ! hay_videos; then
+        echo "Sin videos en $VIDEO_DIR: SIN SEÑAL"
+        sin_senal
+        continue
+    fi
+
+    # Lista barajada; al terminarla se vuelve a barajar (así también entran videos nuevos)
+    mapfile -t lista < <(find "$VIDEO_DIR" -type f 2>/dev/null | grep -iE "$EXT_RE" | shuf)
+    echo "Reproduciendo ${#lista[@]} videos de $VIDEO_DIR (audio: $AUDIO)"
+    inicio=$SECONDS
+    lanzar_vlc "${audio[@]}" --play-and-exit "${lista[@]}"
+    wait "$VLC_PID"
+    rc=$?
+    cerrar_vlc
+    # Error, o fin casi inmediato (p. ej. todos los videos dañados): no relanzar en bucle
+    if [ "$rc" -ne 0 ] || [ $((SECONDS - inicio)) -lt 5 ]; then
+        echo "VLC terminó con error o al instante (código $rc): SIN SEÑAL 10 s y reintento"
+        sin_senal 10
+    fi
+done

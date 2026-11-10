@@ -1,0 +1,42 @@
+#!/usr/bin/python3
+"""minitv-normalizar: deja los nombres de ~/videos en Unicode NFC (la Mac a veces los sube en NFD:
+"ñ" como "n" + tilde aparte) y borra las copias repetidas que eso genera (mismo nombre visible y
+mismo tamaño). También normaliza los nombres guardados en estado.json para no perder el "Seguir".
+Uso: minitv-normalizar   (sin argumentos; seguro de repetir)"""
+import json, os, unicodedata
+
+VIDEOS = os.path.expanduser("~/videos")
+ESTADO = os.path.expanduser("~/.local/state/minitv/estado.json")
+nfc = lambda s: unicodedata.normalize("NFC", s)
+cambios = 0
+for raiz, dirs, archivos in os.walk(VIDEOS, topdown=False):
+    for nombre in archivos + dirs:
+        if nombre.startswith("."):
+            continue                                   # temporales de rsync: no tocar
+        bueno = nfc(nombre)
+        if bueno == nombre:
+            continue
+        viejo, nuevo = os.path.join(raiz, nombre), os.path.join(raiz, bueno)
+        if os.path.isfile(nuevo) and os.path.getsize(nuevo) == os.path.getsize(viejo):
+            os.unlink(viejo)                           # copia repetida idéntica
+            print("repetido borrado:", os.path.relpath(viejo, VIDEOS))
+        elif not os.path.exists(nuevo):
+            os.rename(viejo, nuevo)
+            print("renombrado a NFC:", os.path.relpath(nuevo, VIDEOS))
+        else:
+            print("OJO, mismo nombre y distinto tamaño (no se toca):", os.path.relpath(viejo, VIDEOS))
+            continue
+        cambios += 1
+try:
+    with open(ESTADO) as f:
+        texto = f.read()
+    if nfc(texto) != texto:
+        datos = json.loads(nfc(texto))
+        tmp = ESTADO + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(datos, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, ESTADO)
+        print("estado.json normalizado")
+except (OSError, ValueError):
+    pass
+print(f"{cambios} cambios")

@@ -1,0 +1,147 @@
+#!/bin/bash
+# minitv-imagen: imagen de disco COMPACTA del sistema de la MiniTV, hecha en vivo (sin apagar la Pi ni
+# sacar la tarjeta), lista para grabar con Raspberry Pi Imager en otra tarjeta.
+#
+#   sudo minitv-imagen [CARPETA_DESTINO]        (por defecto /home/paolo/respaldo-imagen)
+#
+# Cómo: crea un archivo de disco del tamaño justo (partición de arranque igual a la original + sistema
+# con lo ocupado y un 15 % de margen), con el MISMO identificador de disco (así /boot/cmdline.txt y
+# /etc/fstab, que usan PARTUUID=2920d00b-0X, funcionan sin cambios), copia el sistema con rsync y lo
+# comprime con pigz. La tarjeta original no se toca. Mientras copia, el servicio minitv se detiene
+# para que nada cambie a mitad de la copia; al terminar (o si algo falla) vuelve a arrancar.
+#
+# No incluye ~/videos ni ~/juegos (se respaldan aparte, en la Mac) ni las fuentes de ~/compilar.
+# En la tarjeta nueva, el primer arranque agranda el sistema a toda la tarjeta (minitv-expandir).
+set -euo pipefail
+
+DEST="${1:-/home/paolo/respaldo-imagen}"
+FECHA=$(date +%Y-%m-%d)
+DISCO=/dev/mmcblk0
+CRUDA="$DEST/minitv-sistema-$FECHA.img"
+FINAL="$CRUDA.gz"
+MNT=/mnt/minitv-imagen
+LOOP=""
+
+[ "$(id -u)" = 0 ] || { echo "Hay que ejecutarlo con sudo" >&2; exit 1; }
+
+EXCLUIR=(
+    /proc/* /sys/* /dev/* /run/* /tmp/* /mnt/* /media/* /lost+found /var/swap /var/tmp/*
+    /var/cache/apt/archives/*.deb
+    /home/paolo/videos/* /home/paolo/juegos/*          # contenido: respaldo aparte en la Mac
+    /home/paolo/respaldo-imagen
+    /home/paolo/compilar/RetroArch /home/paolo/compilar/gambatte /home/paolo/compilar/gpsp
+    /home/paolo/compilar/fceumm /home/paolo/compilar/snes9x2005 /home/paolo/compilar/picodrive
+    /home/paolo/compilar/pcsx_rearmed /home/paolo/compilar/joypad-autoconfig
+    /home/paolo/compilar/prueba-menu /home/paolo/compilar/capturas /home/paolo/compilar/circus
+    # Rust y la compilación de librespot (1,7 GB): no hacen falta para funcionar (librespot ya está
+    # instalado en /usr/local/bin). Para recompilar: rustup + git clone (ver pi/compilar-retroarch.sh).
+    /home/paolo/.rustup /home/paolo/.cargo /home/paolo/compilar/librespot
+)
+OPC_EXCLUIR=()
+for e in "${EXCLUIR[@]}"; do OPC_EXCLUIR+=(--exclude="$e"); done
+
+paso() { echo "[$(date +%H:%M:%S)] $*"; }
+
+limpiar() {
+    set +e
+    mountpoint -q "$MNT/boot" && umount "$MNT/boot"
+    mountpoint -q "$MNT" && umount "$MNT"
+    [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
+    rm -f "$CRUDA"
+    systemctl start minitv
+}
+trap limpiar EXIT
+
+mkdir -p "$DEST" "$MNT"
+chown paolo:paolo "$DEST"                    # la Mac borra aquí la copia temporal al descargarla
+rm -f "$DEST"/minitv-sistema-*.img "$DEST"/minitv-sistema-*.img.gz.tmp
+
+paso "Deteniendo la MiniTV mientras se copia"
+systemctl stop minitv
+sync
+
+# ----- Tamaños -----
+ID_DISCO=$(sfdisk --disk-id "$DISCO")
+read -r BOOT_INICIO BOOT_TAM < <(sfdisk -d "$DISCO" | awk '/p1 :/ { gsub(/[=,]/, " "); print $4, $6 }')
+ROOT_INICIO=$(sfdisk -d "$DISCO" | awk '/p2 :/ { gsub(/[=,]/, " "); print $4 }')
+USADO=$(rsync -aHAXxn --stats "${OPC_EXCLUIR[@]}" / /nonexistente-minitv/ 2>/dev/null \
+        | awk -F': ' '/Total file size/ { gsub(/[^0-9]/, "", $2); print $2 }')
+USADO_MB=$((USADO / 1024 / 1024))
+ROOT_MB=$((USADO_MB * 115 / 100 + 400))       # 15 % de margen + metadatos de ext4
+ROOT_SECT=$((ROOT_MB * 2048))
+paso "Sistema a copiar: $USADO_MB MB -> partición de $ROOT_MB MB (disco $ID_DISCO)"
+
+LIBRE_MB=$(df -m --output=avail "$DEST" | tail -1)
+[ "$LIBRE_MB" -gt $((ROOT_MB * 2 + 512)) ] || { echo "Poco espacio en $DEST ($LIBRE_MB MB)" >&2; exit 1; }
+
+# ----- Disco nuevo: mismas particiones de arranque, sistema del tamaño justo -----
+truncate -s $(((ROOT_INICIO + ROOT_SECT) * 512)) "$CRUDA"
+sfdisk -q "$CRUDA" <<EOF
+label: dos
+label-id: $ID_DISCO
+unit: sectors
+
+start=$BOOT_INICIO, size=$BOOT_TAM, type=c
+start=$ROOT_INICIO, size=$ROOT_SECT, type=83
+EOF
+LOOP=$(losetup -fP --show "$CRUDA")
+mkfs.vfat -F 32 -n BOOT "${LOOP}p1" > /dev/null
+mkfs.ext4 -q -F -L rootfs -m 1 "${LOOP}p2"
+mount "${LOOP}p2" "$MNT"
+mkdir -p "$MNT/boot"
+mount "${LOOP}p1" "$MNT/boot"
+
+paso "Copiando el arranque (/boot)"
+rsync -rt --modify-window=2 /boot/ "$MNT/boot/"
+paso "Copiando el sistema (puede tardar unos minutos)"
+rsync -aHAXx --numeric-ids "${OPC_EXCLUIR[@]}" / "$MNT/"
+for d in proc sys dev run mnt media var/tmp; do mkdir -p "$MNT/$d"; done
+install -d -m 1777 "$MNT/tmp"
+install -d -o paolo -g paolo "$MNT/home/paolo/videos" "$MNT/home/paolo/juegos"
+
+# ----- Primer arranque en una tarjeta nueva: agrandar el sistema a toda la tarjeta (una sola vez) -----
+cat > "$MNT/usr/local/sbin/minitv-expandir" <<'EOF'
+#!/bin/sh
+# Agranda la partición del sistema y su ext4 hasta el final de la tarjeta (en caliente, sin reiniciar).
+# Lo instala minitv-imagen en la imagen de respaldo; se ejecuta una vez y se desactiva solo.
+P=/sys/block/mmcblk0/mmcblk0p2
+FIN=$(( $(cat $P/start) + $(cat $P/size) ))
+TOTAL=$(cat /sys/block/mmcblk0/size)
+if [ $((TOTAL - FIN)) -gt 8192 ]; then
+    echo ", +" | sfdisk --no-reread --force -N 2 /dev/mmcblk0
+    partx -u /dev/mmcblk0
+    resize2fs /dev/mmcblk0p2
+fi
+systemctl disable minitv-expandir.service
+EOF
+chmod 755 "$MNT/usr/local/sbin/minitv-expandir"
+cat > "$MNT/etc/systemd/system/minitv-expandir.service" <<'EOF'
+[Unit]
+Description=MiniTV: agrandar el sistema a toda la tarjeta (primer arranque de una imagen de respaldo)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/minitv-expandir
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ln -sf /etc/systemd/system/minitv-expandir.service "$MNT/etc/systemd/system/multi-user.target.wants/minitv-expandir.service"
+
+# ----- Comprobar y comprimir -----
+sync
+umount "$MNT/boot"
+umount "$MNT"
+paso "Revisando los sistemas de archivos de la imagen"
+fsck.vfat -n "${LOOP}p1" > /dev/null
+e2fsck -fy "${LOOP}p2" > /dev/null || [ $? -le 1 ]
+losetup -d "$LOOP"; LOOP=""
+systemctl start minitv                             # la TV vuelve mientras se comprime
+paso "Comprimiendo (pigz, 4 núcleos)"
+pigz -6 -c "$CRUDA" > "$FINAL.tmp"
+mv "$FINAL.tmp" "$FINAL"
+rm -f "$CRUDA"
+sha256sum "$FINAL" | awk '{print $1}' > "$FINAL.sha256"
+chown paolo:paolo "$FINAL" "$FINAL.sha256"
+paso "Listo: $FINAL ($(du -h "$FINAL" | cut -f1); imagen sin comprimir: $(((ROOT_INICIO + ROOT_SECT) / 2048)) MB)"

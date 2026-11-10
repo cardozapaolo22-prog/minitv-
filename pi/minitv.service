@@ -1,0 +1,25 @@
+[Unit]
+Description=MiniTV: menú y canales en la pantalla ILI9341
+# Arranque temprano: solo espera a fbcp y a la raíz montada en escritura (no a /boot,
+# a la red ni al volumen de ALSA: el límite de volumen lo aplica VLC con AUDIO_GAIN).
+DefaultDependencies=no
+After=fbcp-ili9341.service systemd-remount-fs.service systemd-journald.socket
+Wants=fbcp-ili9341.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+User=paolo
+Group=paolo
+# Limpia la consola de tty1 y oculta el cursor para que no se vea entre videos
+# (el "+" lo ejecuta como root, que es quien puede escribir en /dev/tty1)
+ExecStartPre=+/bin/sh -c 'TERM=linux setterm --cursor off --clear all > /dev/tty1'
+ExecStart=/usr/local/bin/minitv
+# /run/minitv: sockets de control (minitv-control) y de VLC, a nombre de paolo
+RuntimeDirectory=minitv
+Restart=always
+RestartSec=3
+TimeoutStopSec=6
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+#!/usr/bin/python3
+"""minitv-control: simula los botones y el encoder de la Mini TV (para usar por SSH).
+
+Uso: minitv-control ORDEN [ORDEN ...]
+  arriba    subir en el menú
+  abajo     bajar en el menú                       (botón 2, pulsación corta)
+  elegir    elegir                                 (botón 2 mantenido / pulsar el encoder)
+  menu      abrir o cerrar el menú                 (botón 1, pulsación corta)
+  apagar    apagar con la animación de tubo        (botón 1 mantenido 2 s)
+  girar+    girar el encoder a la derecha  (menú: bajar; episodio: subir volumen)
+  girar-    girar el encoder a la izquierda (menú: subir; episodio: bajar volumen)
+Ejemplo: minitv-control abajo abajo elegir
+"""
+import socket
+import sys
+import time
+
+ORDENES = {"arriba", "abajo", "elegir", "menu", "apagar", "girar+", "girar-"}
+SOCK = "/run/minitv/control.sock"
+
+args = [a.lower() for a in sys.argv[1:]]
+if not args or any(a not in ORDENES for a in args):
+    print(__doc__.strip())
+    sys.exit(1)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+for i, orden in enumerate(args):
+    try:
+        s.sendto(orden.encode(), SOCK)
+    except OSError as e:
+        sys.exit(f"No se pudo enviar '{orden}' a la Mini TV ({e}). ¿Está funcionando el servicio minitv?")
+    if i < len(args) - 1:
+        time.sleep(0.25)

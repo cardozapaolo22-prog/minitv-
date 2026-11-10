@@ -1,0 +1,13 @@
+# Videos, pruebas y archivos generados (pesan GB o son personales)
+minitv_320x240*/
+prueba-calidad/
+juegos-prueba/
+capturas/
+*.log
+lista-oro.txt
+# Copias de seguridad de cada cambio (.bak-N)
+*.bak-*
+*.orig
+# Logos de canales (marcas registradas: solo viven en la TV, ~/videos/logos)
+pi/logos/
+.DS_Store

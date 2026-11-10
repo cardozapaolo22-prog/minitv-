@@ -1,0 +1,51 @@
+diff --git a/config.h b/config.h
+index 65d8067..243def2 100644
+--- a/config.h
++++ b/config.h
+@@ -201,14 +201,16 @@
+ 
+ // If enabled, reads keyboard for input events to detect when the system has gone inactive and backlight
+ // can be turned off
+-#define BACKLIGHT_CONTROL_FROM_KEYBOARD
++// MiniTV: desactivado (no apagar la luz por inactividad)
++// #define BACKLIGHT_CONTROL_FROM_KEYBOARD
+ 
+ // This device file is used to capture keyboard input. This may be "/dev/input/event0" or something else
+ // on some Pis
+ #define KEYBOARD_INPUT_FILE "/dev/input/event1"
+ 
+ // If enabled, the display backlight will be turned off after this many usecs of no activity on screen.
+-#define TURN_DISPLAY_OFF_AFTER_USECS_OF_INACTIVITY (1 * 60 * 1000000)
++// MiniTV: desactivado (no apagar la luz por inactividad)
++// #define TURN_DISPLAY_OFF_AFTER_USECS_OF_INACTIVITY (1 * 60 * 1000000)
+ 
+ #endif
+ 
+diff --git a/ili9341.cpp b/ili9341.cpp
+index 5af3363..93baa79 100644
+--- a/ili9341.cpp
++++ b/ili9341.cpp
+@@ -97,10 +97,6 @@ void InitILI9341()
+     usleep(120 * 1000);
+     SPI_TRANSFER(/*Display ON*/0x29);
+ 
+-#if defined(GPIO_TFT_BACKLIGHT) && defined(BACKLIGHT_CONTROL)
+-    printf("Setting TFT backlight on at pin %d\n", GPIO_TFT_BACKLIGHT);
+-    TurnBacklightOn();
+-#endif
+ 
+     // Some wonky effects to try out:
+ //    SPI_TRANSFER(0x20/*Display Inversion OFF*/);
+@@ -109,6 +105,12 @@ void InitILI9341()
+ //    SPI_TRANSFER(0x39/*Idle Mode ON*/); // Idle mode gives a super-saturated high contrast reduced colors mode
+ 
+     ClearScreen();
++
++    // MiniTV: encender la luz de fondo solo cuando el panel ya está en negro (sin destello)
++#if defined(GPIO_TFT_BACKLIGHT) && defined(BACKLIGHT_CONTROL)
++    printf("Setting TFT backlight on at pin %d\n", GPIO_TFT_BACKLIGHT);
++    TurnBacklightOn();
++#endif
+   }
+ #ifndef USE_DMA_TRANSFERS // For DMA transfers, keep SPI CS & TA active.
+   END_SPI_COMMUNICATION();

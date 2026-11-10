@@ -1,0 +1,16 @@
+[Unit]
+Description=MiniTV: control remoto web (http://minitv.local) y mando virtual
+After=network.target
+
+[Service]
+User=paolo
+Group=paolo
+SupplementaryGroups=input
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/bin/minitv-remoto
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

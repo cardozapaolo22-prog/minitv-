@@ -1,0 +1,43 @@
+#!/bin/sh
+# minitv-spotify-evento: lo ejecuta librespot (raspotify, opción LIBRESPOT_ONEVENT) en cada evento de
+# Spotify Connect. Deja el estado en archivos de /run/raspotify que minitv lee (no guarda datos de la
+# cuenta: ignora USER_NAME y demás). Cada archivo se escribe completo y luego se renombra.
+#   pista.txt         canción actual (NAME, ARTISTS, ALBUM, COVERS, DURATION_MS)
+#   reproduccion.txt  loading / playing / paused / stopped, POSITION_MS y la hora del evento
+#   volumen.txt       VOLUME (0..65535)
+D=/run/raspotify
+escribir() {  # escribir ARCHIVO  (contenido por la entrada estándar)
+    cat > "$D/.$1.tmp" && mv "$D/.$1.tmp" "$D/$1"
+}
+una_linea() { printf '%s' "$1" | tr '\n\t' '| '; }
+ahora_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+
+case "$PLAYER_EVENT" in
+    track_changed)
+        {
+            printf 'NAME\t%s\n' "$(una_linea "$NAME")"
+            printf 'ARTISTS\t%s\n' "$(una_linea "$ARTISTS")"
+            printf 'ALBUM\t%s\n' "$(una_linea "$ALBUM")"
+            printf 'COVERS\t%s\n' "$(una_linea "$COVERS")"
+            printf 'DURATION_MS\t%s\n' "$DURATION_MS"
+            printf 'TRACK_ID\t%s\n' "$TRACK_ID"
+        } | escribir pista.txt ;;
+    playing|paused|seeked|position_correction)
+        estado=$PLAYER_EVENT
+        if [ "$estado" = seeked ] || [ "$estado" = position_correction ]; then
+            # conservar si estaba sonando o en pausa
+            estado=$(sed -n 's/^STATE\t//p' "$D/reproduccion.txt" 2>/dev/null)
+            [ -n "$estado" ] || estado=playing
+        fi
+        printf 'STATE\t%s\nPOSITION_MS\t%s\nAT_MS\t%s\n' "$estado" "${POSITION_MS:-0}" "$(ahora_ms)" \
+            | escribir reproduccion.txt ;;
+    loading)
+        # Spotify empieza a cargar una canción: minitv libera el audio (detiene VLC) antes de que suene
+        printf 'STATE\tloading\nPOSITION_MS\t%s\nAT_MS\t%s\n' "${POSITION_MS:-0}" "$(ahora_ms)" \
+            | escribir reproduccion.txt ;;
+    stopped|session_disconnected)
+        printf 'STATE\tstopped\nPOSITION_MS\t0\nAT_MS\t%s\n' "$(ahora_ms)" | escribir reproduccion.txt ;;
+    volume_changed)
+        printf 'VOLUME\t%s\n' "$VOLUME" | escribir volumen.txt ;;
+esac
+exit 0

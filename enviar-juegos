@@ -1,0 +1,383 @@
+#!/bin/bash
+# Envía juegos a la MiniTV (Raspberry Pi Zero 2 W), cada uno a la carpeta de su consola:
+#   ~/juegos/gb  gbc  gba  nes  snes  genesis  psx      y la BIOS de PlayStation a ~/juegos/bios
+# La consola se deduce de la extensión; los .bin se resuelven por contenido (cabecera "SEGA"
+# = Genesis; si lo acompaña un .cue = PlayStation). Con -c se fuerza la consola.
+#
+# Portadas: por cada juego subido busca su carátula en las miniaturas de libretro
+# (thumbnails.libretro.com: Named_Boxarts y, si no hay, Named_Titles) por el nombre del juego;
+# si tampoco hay, la Pi saca una captura de la pantalla de título (RetroArch sin imagen ni sonido).
+# La imagen se reduce AQUÍ, en la Mac (sips), al tamaño exacto que dibuja el menú y se envía a
+# ~/juegos/<consola>/portadas/<nombre del juego>.png
+# Sin Python ni git: solo herramientas que trae macOS (bash, curl, perl, sips).
+set -euo pipefail
+
+PI_HOST="${MINITV_HOST:-paolo@raspberrypi.local}"
+PI_DIR="${MINITV_JUEGOS:-juegos}"
+CONSOLA=""          # -c: forzar consola
+BIOS=no             # -b: los archivos son BIOS
+PRUEBA=no           # -n: solo mostrar qué haría
+PORTADAS=si         # -S: no buscar portadas
+SOLO_PORTADAS=no    # -P: solo portadas de los juegos que ya están en la Pi
+REHACER=no          # -f: con -P, rehacer también las que ya existen
+CONSOLAS="gb gbc gba nes snes genesis psx arcade"
+# Tamaño máximo de la portada: el mismo hueco que reserva el menú de minitv (PORTADA_W x PORTADA_H)
+PORTADA_W=118
+PORTADA_H=128
+CACHE="${TMPDIR:-/tmp}/minitv-portadas"
+LIBRETRO="https://thumbnails.libretro.com"
+# Lista de juegos arcade de FinalBurn Neo (nombre corto del zip -> título): reconoce los romsets y los nombra
+FBNEO_DAT="https://raw.githubusercontent.com/libretro/FBNeo/master/dats/FinalBurn%20Neo%20(ClrMame%20Pro%20XML%2C%20Arcade%20only).dat"
+
+uso() {
+    cat <<EOF
+Uso: $(basename "$0") [opciones] JUEGO|CARPETA ...
+     $(basename "$0") -P [-f]          (portadas de los juegos que ya están en la MiniTV)
+
+  -c CONSOLA  forzar la consola de destino: $CONSOLAS
+  -b          enviar BIOS (p. ej. scph1001.bin) a $PI_HOST:$PI_DIR/bios
+  -n          prueba: mostrar a qué consola iría cada archivo, sin enviar nada
+  -S          no buscar portadas
+  -P          buscar portadas para los juegos que ya están en la MiniTV y no tienen
+  -f          con -P: rehacer también las portadas que ya existen
+  -h          mostrar esta ayuda
+
+Reconoce: .gb .gbc .gba .nes .sfc .smc .md .gen .smd .bin .cue .chd .pbp .m3u .zip
+  - PlayStation: envía el .cue con todos sus .bin (o .chd/.pbp, más cómodos: un solo archivo).
+  - .zip: se mira qué hay dentro y se envía tal cual (excepto PlayStation, que debe ir descomprimido).
+  - Las carpetas se recorren enteras; se ignoran los archivos ocultos "._*" de los USB.
+  - Portadas: carátula de libretro, si no la pantalla de título de libretro, si no una captura.
+
+Ejemplos:
+  $(basename "$0") ~/Downloads/juegos/
+  $(basename "$0") "Mi juego (USA).cue"
+  $(basename "$0") -c genesis rom-sin-extension-clara.bin
+  $(basename "$0") -b ~/Downloads/scph1001.bin
+  $(basename "$0") -P
+EOF
+}
+
+while getopts "c:bnSPfh" opt; do
+    case $opt in
+        c) CONSOLA=$OPTARG ;;
+        b) BIOS=si ;;
+        n) PRUEBA=si ;;
+        S) PORTADAS=no ;;
+        P) SOLO_PORTADAS=si ;;
+        f) REHACER=si ;;
+        h) uso; exit 0 ;;
+        *) uso; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -gt 0 ] || [ "$SOLO_PORTADAS" = si ] || { uso; exit 1; }
+if [ -n "$CONSOLA" ] && ! [[ " $CONSOLAS " == *" $CONSOLA "* ]]; then
+    echo "Consola desconocida: $CONSOLA (usa una de: $CONSOLAS)" >&2; exit 1
+fi
+
+minus() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Consola según la extensión de un nombre de archivo ("" si no se reconoce).
+por_extension() {
+    case "$(minus "${1##*.}")" in
+        gb) echo gb ;;
+        gbc) echo gbc ;;
+        gba) echo gba ;;
+        nes) echo nes ;;
+        sfc|smc) echo snes ;;
+        md|gen|smd) echo genesis ;;
+        cue|chd|pbp|m3u) echo psx ;;
+        *) echo "" ;;
+    esac
+}
+
+# ¿Lo referencia algún .cue de su misma carpeta?
+tiene_cue() {
+    local bin dir c
+    bin=$(basename "$1"); dir=$(dirname "$1")
+    for c in "$dir"/*.cue "$dir"/*.CUE; do
+        [ -f "$c" ] && grep -qF "$bin" "$c" && return 0
+    done
+    return 1
+}
+
+# Título de un romset arcade según FinalBurn Neo ("" si no es uno). La lista se guarda en caché un mes.
+nombre_arcade() {   # nombre_arcade simpsons
+    local dat="$CACHE/fbneo.dat"
+    mkdir -p "$CACHE"
+    if [ ! -s "$dat" ] || [ -n "$(find "$dat" -mtime +30 2>/dev/null)" ]; then
+        curl -fsSL --max-time 120 -o "$dat.tmp" "$FBNEO_DAT" 2>/dev/null && mv "$dat.tmp" "$dat" || rm -f "$dat.tmp"
+    fi
+    [ -s "$dat" ] || return 0
+    perl -ne 'BEGIN { $q = shift } if (/<game name="\Q$q\E"/) { $e = 1 } if ($e && /<description>(.*?)<\/description>/) { $d = $1; $d =~ s/&amp;/&/g; $d =~ s/&apos;/\x27/g; $d =~ s/&quot;/"/g; print $d; exit }' "$1" "$dat"
+}
+
+# Consola de un archivo concreto ("" si no se reconoce o no hay que enviarlo suelto).
+consola_de() {
+    local f=$1 ext c
+    ext=$(minus "${f##*.}")
+    if [ "$ext" = bin ]; then
+        if tiene_cue "$f"; then echo "psx-pista"; return; fi     # va junto con su .cue
+        if [ "$(dd if="$f" bs=1 skip=256 count=4 2>/dev/null)" = "SEGA" ]; then echo genesis; return; fi
+        echo ""; return
+    fi
+    if [ "$ext" = zip ]; then
+        local dentro
+        dentro=$(unzip -Z1 "$f" 2>/dev/null | grep -v '/$' | grep -v '^__MACOSX' | head -1)
+        c=$(por_extension "$dentro")
+        if [ "$c" = psx ]; then echo "psx-zip"; return; fi
+        if [ -z "$c" ] && [ -n "$(nombre_arcade "$(basename "$f" .zip)")" ]; then echo arcade; return; fi
+        echo "$c"; return
+    fi
+    por_extension "$f"
+}
+
+# Archivos .bin que nombra un .cue (rutas en la misma carpeta).
+pistas_de_cue() {
+    local cue=$1 dir
+    dir=$(dirname "$cue")
+    grep -i '^ *FILE' "$cue" | sed -E 's/^ *[Ff][Ii][Ll][Ee] +"?([^"]*)"? +[A-Za-z0-9]+ *\r?$/\1/' | while read -r p; do
+        echo "$dir/$p"
+    done
+}
+
+# =============================================================================================
+# Portadas
+# =============================================================================================
+
+sistema_libretro() {
+    case "$1" in
+        gb) echo "Nintendo - Game Boy" ;;
+        gbc) echo "Nintendo - Game Boy Color" ;;
+        gba) echo "Nintendo - Game Boy Advance" ;;
+        nes) echo "Nintendo - Nintendo Entertainment System" ;;
+        snes) echo "Nintendo - Super Nintendo Entertainment System" ;;
+        genesis) echo "Sega - Mega Drive - Genesis" ;;
+        psx) echo "Sony - PlayStation" ;;
+        arcade) echo "FBNeo - Arcade Games" ;;
+    esac
+}
+
+nucleo_de() {
+    case "$1" in
+        gb|gbc) echo gambatte ;; gba) echo gpsp ;; nes) echo fceumm ;; snes) echo snes9x2005 ;;
+        genesis) echo picodrive ;; psx) echo pcsx_rearmed ;; arcade) echo fbneo ;;
+    esac
+}
+
+url_codificar() { perl -pe 'chomp; s/([^A-Za-z0-9\-._~()!,'"'"'])/sprintf("%%%02X", ord($1))/ge'; }
+
+# Lista (decodificada, un nombre por línea) de las imágenes de libretro de una consola y tipo.
+# Se guarda en caché una semana.
+listado() {   # listado CONSOLA Named_Boxarts|Named_Titles
+    local archivo="$CACHE/$1-$2.txt" sis
+    mkdir -p "$CACHE"
+    if [ ! -s "$archivo" ] || [ -n "$(find "$archivo" -mtime +7 2>/dev/null)" ]; then
+        sis=$(sistema_libretro "$1" | url_codificar)
+        curl -fsS --max-time 120 "$LIBRETRO/$sis/$2/" 2>/dev/null \
+            | perl -ne 'while (/href="([^"\/]+\.png)"/g) { my $n = $1; $n =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/ge; print "$n\n"; }' \
+            > "$archivo.tmp" && mv "$archivo.tmp" "$archivo" || rm -f "$archivo.tmp"
+    fi
+    [ -s "$archivo" ] && cat "$archivo"
+    return 0
+}
+
+# Mejor imagen de libretro para un juego: mismo título (sin etiquetas, mayúsculas ni signos);
+# entre varias, la versión limpia y por región USA > World > Europe > Japan.
+buscar_imagen() {   # buscar_imagen CONSOLA TIPO "Nombre del juego"
+    listado "$1" "$2" | perl -e '
+        use utf8; binmode STDIN, ":utf8"; binmode STDOUT, ":utf8";
+        my $buscado = shift; utf8::decode($buscado);
+        sub clave { my $s = lc shift; $s =~ s/\.png$//; $s =~ s/\([^)]*\)|\[[^\]]*\]//g; $s =~ s/^the\s+|,\s*the\b//g; $s =~ s/[^a-z0-9]//g; $s }
+        my $k = clave($buscado); exit unless length $k;
+        my ($mejor, $pm) = ("", 1e9);
+        while (my $n = <STDIN>) {
+            chomp $n; next unless clave($n) eq $k;
+            if ($n eq "$buscado.png") { $mejor = $n; last }      # nombre exacto (arcade: título de FBNeo)
+            my $p = 0;
+            $p += 100 if $n =~ /\[/;                       # hacks, malos volcados, traducciones...
+            $p += 50  if $n =~ /\(\d{4}[-)x]/ || $n =~ /\(19xx\)/;   # nombres estilo TOSEC
+            $p += $n =~ /\(USA/ ? 0 : $n =~ /\(World/ ? 1 : $n =~ /\(Europe/ ? 2 : $n =~ /\(Japan/ ? 3 : 5;
+            $p += 10 if $n =~ /\((Beta|Proto|Demo|Sample)/i;
+            ($mejor, $pm) = ($n, $p) if $p < $pm;
+        }
+        print $mejor;' "$3"
+}
+
+# Reduce una imagen al hueco de la portada (sin deformar) y la deja en PNG.
+reducir() {   # reducir ENTRADA SALIDA
+    local w h nw nh
+    w=$(sips -g pixelWidth "$1" 2>/dev/null | awk '/pixelWidth/ {print $2}')
+    h=$(sips -g pixelHeight "$1" 2>/dev/null | awk '/pixelHeight/ {print $2}')
+    [ -n "$w" ] && [ -n "$h" ] || return 1
+    read -r nw nh < <(awk -v w="$w" -v h="$h" -v W="$PORTADA_W" -v H="$PORTADA_H" \
+        'BEGIN { k = W / w; if (H / h < k) k = H / h; printf "%d %d\n", w * k + 0.5, h * k + 0.5 }')
+    sips -s format png -z "$nh" "$nw" "$1" --out "$2" > /dev/null 2>&1
+}
+
+# Busca, reduce y envía la portada de un juego que ya está en la Pi.
+poner_portada() {   # poner_portada CONSOLA ARCHIVO_DEL_JUEGO
+    local consola=$1 juego=$2 base nombre tmp origen="" img url sis remoto_q
+    base="${juego%.*}"
+    nombre=$base
+    if [ "$consola" = arcade ]; then
+        # Romset arcade: nombre real de FinalBurn Neo para el menú (nombres.txt) y para buscar la portada
+        local largo nombres_q
+        largo=$(nombre_arcade "$base")
+        if [ -n "$largo" ]; then
+            nombre=$largo
+            nombres_q=$(printf '%q' "$PI_DIR/arcade/nombres.txt")
+            printf '%s\t%s\n' "$base" "$largo" | ssh "$PI_HOST" "touch $nombres_q; grep -v $(printf '%q' "^$base$(printf '\t')") $nombres_q > $nombres_q.tmp; cat >> $nombres_q.tmp; mv $nombres_q.tmp $nombres_q"
+        fi
+    fi
+    case "$(minus "${juego##*.}")" in zip) ;; esac
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/portada.XXXXXX")
+    sis=$(sistema_libretro "$consola" | url_codificar)
+    for tipo in Named_Boxarts Named_Titles; do
+        img=$(buscar_imagen "$consola" "$tipo" "$nombre")
+        if [ -n "$img" ]; then
+            url="$LIBRETRO/$sis/$tipo/$(printf '%s' "$img" | url_codificar)"
+            if curl -fsS --max-time 60 -o "$tmp/original.png" "$url" 2>/dev/null; then
+                origen="libretro ($([ $tipo = Named_Boxarts ] && echo carátula || echo pantalla de título): $img)"
+                break
+            fi
+        fi
+    done
+    if [ -z "$origen" ]; then
+        # Captura de la pantalla de título en la Pi: RetroArch sin imagen, sonido ni mandos,
+        # sin tocar las partidas guardadas. No se ve en la pantalla de la MiniTV.
+        local frames=600 rom_q
+        [ "$consola" = psx ] && frames=1500
+        [ "$consola" = arcade ] && frames=900
+        rom_q=$(printf '%q' "$PI_DIR/$consola/$juego")
+        if ssh -n "$PI_HOST" "set -e; d=\$(mktemp -d); trap 'rm -rf \$d' EXIT
+            printf 'video_driver = \"null\"\naudio_driver = \"null\"\ninput_driver = \"null\"\ninput_joypad_driver = \"null\"\nnetwork_cmd_enable = \"false\"\nsavestate_auto_load = \"false\"\nsavestate_auto_save = \"false\"\nsavefile_directory = \"%s\"\n' \"\$d\" > \$d/ra.cfg
+            timeout 120 retroarch --config /usr/local/share/minitv/retroarch.cfg --appendconfig \$d/ra.cfg \
+                --max-frames=$frames --max-frames-ss --max-frames-ss-path=/tmp/minitv-captura.png \
+                -L /usr/local/lib/libretro/$(nucleo_de "$consola")_libretro.so $rom_q > /dev/null 2>&1
+            test -s /tmp/minitv-captura.png" \
+           && scp -q "$PI_HOST:/tmp/minitv-captura.png" "$tmp/original.png"; then
+            origen="captura de la pantalla de título"
+        fi
+    fi
+    if [ -z "$origen" ] || ! reducir "$tmp/original.png" "$tmp/portada.png"; then
+        echo "  Sin portada: $juego" >&2
+        rm -rf "$tmp"; return 0
+    fi
+    remoto_q=$(printf '%q' "$PI_DIR/$consola/portadas")
+    ssh -n "$PI_HOST" "mkdir -p $remoto_q"
+    if rsync -t "$tmp/portada.png" "$PI_HOST:$remoto_q/$(printf '%q' "$base.png")" < /dev/null; then
+        echo "  Portada: $base ← $origen ($(sips -g pixelWidth -g pixelHeight "$tmp/portada.png" | awk '/pixel/ {printf "%s%s", s, $2; s="x"}'))"
+    fi
+    rm -rf "$tmp"
+}
+
+# =============================================================================================
+# Envío
+# =============================================================================================
+
+ENVIADOS=0; FALLIDOS=0; IGNORADOS=0
+CREADAS=" "
+
+enviar() {   # enviar CARPETA_DESTINO ARCHIVO...   (el primero es el juego; devuelve 1 si falla)
+    local dest=$1; shift
+    local dest_q
+    dest_q=$(printf '%q' "$PI_DIR/$dest")
+    if [ "$PRUEBA" = si ]; then
+        for f in "$@"; do echo "  [prueba] $(basename "$f")  ->  $PI_DIR/$dest"; done
+        return 0
+    fi
+    if [[ "$CREADAS" != *" $dest "* ]]; then
+        ssh -n "$PI_HOST" "mkdir -p $dest_q"     # -n: que no lea la lista de archivos del bucle
+        CREADAS="$CREADAS$dest "
+    fi
+    # Sin --partial: si la subida se corta no queda un archivo a medias que el menú muestre.
+    if rsync -t "$@" "$PI_HOST:$dest_q/" < /dev/null; then
+        for f in "$@"; do echo "  Enviado a $dest: $(basename "$f")"; done
+        ENVIADOS=$((ENVIADOS + $#))
+        if [ "$PORTADAS" = si ] && [ "$dest" != bios ]; then
+            poner_portada "$dest" "$(basename "$1")"
+        fi
+    else
+        echo "  ERROR al enviar: $*" >&2
+        FALLIDOS=$((FALLIDOS + $#))
+        return 1
+    fi
+}
+
+procesar() {
+    local f=$1 c
+    case "$(basename "$f")" in ._*|.*) return ;; esac
+    if [ "$BIOS" = si ]; then enviar bios "$f" || true; return; fi
+    if [ -n "$CONSOLA" ]; then
+        c=$CONSOLA
+        [ "$c" = psx ] && [ "$(minus "${f##*.}")" = bin ] && tiene_cue "$f" && return   # irá con su .cue
+    else
+        c=$(consola_de "$f")
+    fi
+    case "$c" in
+        psx-pista) return ;;                         # se envía al procesar su .cue
+        psx-zip)
+            echo "  Saltado (PlayStation comprimido; descomprímelo primero): $(basename "$f")" >&2
+            IGNORADOS=$((IGNORADOS + 1)); return ;;
+        "")
+            case "$(minus "${f##*.}")" in
+                txt|png|jpg|nfo|xml|md|sav|srm) ;;   # acompañantes habituales: sin aviso
+                *) echo "  No sé de qué consola es (usa -c): $(basename "$f")" >&2 ;;
+            esac
+            IGNORADOS=$((IGNORADOS + 1)); return ;;
+    esac
+    if [ "$c" = psx ] && [ "$(minus "${f##*.}")" = cue ]; then
+        local archivos=("$f") p
+        while IFS= read -r p; do
+            if [ -f "$p" ]; then archivos+=("$p")
+            else echo "  ERROR: falta $(basename "$p"), que pide $(basename "$f")" >&2; FALLIDOS=$((FALLIDOS + 1)); return
+            fi
+        done < <(pistas_de_cue "$f")
+        enviar psx "${archivos[@]}" || true
+        return
+    fi
+    enviar "$c" "$f" || true
+}
+
+# -P: portadas de los juegos que ya están en la Pi
+if [ "$SOLO_PORTADAS" = si ]; then
+    n=0
+    while IFS=/ read -r consola juego; do
+        [ -n "$juego" ] || continue
+        if [ "$PRUEBA" = si ]; then echo "  [prueba] portada para $consola/$juego"; continue; fi
+        poner_portada "$consola" "$juego"; n=$((n + 1))
+    done < <(ssh -n "$PI_HOST" "cd $(printf '%q' "$PI_DIR") 2>/dev/null || exit 0
+        for c in $CONSOLAS; do
+            [ -d \"\$c\" ] || continue
+            for f in \"\$c\"/*; do
+                [ -f \"\$f\" ] || continue
+                b=\$(basename \"\$f\"); e=\$(echo \"\${b##*.}\" | tr A-Z a-z)
+                case \"\$c:\$e\" in
+                    gb:gb|gb:zip|gbc:gbc|gbc:gb|gbc:zip|gba:gba|gba:zip|nes:nes|nes:zip|snes:sfc|snes:smc|snes:zip) ;;
+                    genesis:md|genesis:gen|genesis:smd|genesis:bin|genesis:zip) ;;
+                    psx:cue|psx:chd|psx:pbp|psx:m3u|psx:exe|arcade:zip) ;;
+                    *) continue ;;
+                esac
+                [ $REHACER = si ] || [ ! -f \"\$c/portadas/\${b%.*}.png\" ] || continue
+                echo \"\$c/\$b\"
+            done
+        done")
+    echo "Listo: $n juegos revisados."
+    exit 0
+fi
+
+for arg in "$@"; do
+    if [ -d "$arg" ]; then
+        while IFS= read -r -d '' f; do procesar "$f"; done < <(find "$arg" -type f ! -name '._*' -print0 | sort -z)
+    elif [ -f "$arg" ]; then
+        procesar "$arg"
+    else
+        echo "  No existe: $arg" >&2; FALLIDOS=$((FALLIDOS + 1))
+    fi
+done
+
+[ "$PRUEBA" = si ] && exit 0
+echo "Listo: $ENVIADOS enviados, $IGNORADOS ignorados, $FALLIDOS con error."
+[ $ENVIADOS -gt 0 ] && echo "La MiniTV los verá la próxima vez que abras Juegos en el menú."
+[ $FALLIDOS -eq 0 ]

@@ -1,0 +1,27 @@
+# Canales de la categoría TV (~/videos/canales.txt en la MiniTV)
+# Cada canal pasa episodios al azar de sus series, con su mosca en la esquina y "Más adelante".
+# «Todo» siempre mezcla todas las series: no hace falta ponerlo aquí.
+#
+# Formato:
+#   [Nombre del canal]
+#   Nombre de la serie     (como la carpeta de ~/videos, sin el número: "Drake y Josh")
+#   mosca: izquierda       (opcional: la mosca abajo a la izquierda; si no, a la derecha)
+# Logos: ~/videos/logos/<Nombre del canal>.png (si no hay, se ven las siglas).
+# Una serie puede estar en varios canales. Un canal sin series con episodios no aparece en el menú.
+# Después de editar: volver al menú (botón 1) y la TV lo vuelve a leer.
+
+[Cartoon Network]
+Más allá del jardín
+Fantasías animadas de ayer y hoy
+
+[Disney Channel]
+mosca: izquierda
+Dave el Bárbaro
+Zack y Cody
+
+[Nickelodeon]
+Drake y Josh
+Los Padrinos Mágicos
+
+[FOX]
+Los Simpson

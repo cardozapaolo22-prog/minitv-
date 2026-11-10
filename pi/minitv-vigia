@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+"""minitv-vigia: decide cuándo se ve la estática encima de VLC.
+
+Pregunta a VLC (interfaz rc por socket Unix) cuántos cuadros ha mostrado del video actual:
+  - en cuanto el contador es mayor que 0  -> oculta la estática (USR1): ya hay imagen.
+  - si el contador vuelve a 0 o desaparece (cambio de video) -> muestra la estática (USR2).
+  - si VLC se cierra -> muestra la estática y termina.
+VLC actualiza el contador cada ~0,5 s, así que la estática puede quedar hasta medio segundo
+encima del primer cuadro, pero nunca se retira antes de que haya imagen.
+
+Uso: minitv-vigia SOCKET PID_ESTATICA
+"""
+import os
+import re
+import signal
+import socket
+import sys
+import time
+
+sock_path, pid_estatica = sys.argv[1], int(sys.argv[2])
+patron = re.compile(rb"frames displayed\s*:\s*(\d+)")
+
+
+def avisar(sig, texto):
+    try:
+        os.kill(pid_estatica, sig)
+    except ProcessLookupError:
+        sys.exit(0)
+    print(f"[{time.clock_gettime(time.CLOCK_MONOTONIC):.3f}] {texto}", flush=True)
+
+
+# Esperar a que VLC abra su socket de control (máx. 30 s)
+limite = time.monotonic() + 30
+while True:
+    try:
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(sock_path)
+        break
+    except OSError:
+        if time.monotonic() > limite:
+            sys.exit(1)
+        time.sleep(0.05)
+c.settimeout(0.3)
+FIN = b"end of statistical info"
+
+estatica_visible = True   # minitv-estatica arranca visible
+pendiente = b""
+sin_respuesta = 0         # consultas seguidas sin respuesta completa
+try:
+    while True:
+        c.sendall(b"stats\n")
+        # Mientras VLC no tiene ningún video abierto, "stats" no devuelve el bloque completo:
+        # si no llega a tiempo cuenta como "todavía sin imagen" (no como VLC cerrado).
+        limite = time.monotonic() + 0.3
+        while FIN not in pendiente and time.monotonic() < limite:
+            try:
+                trozo = c.recv(4096)
+            except socket.timeout:
+                break
+            if not trozo:          # conexión cerrada de verdad: VLC terminó
+                raise ConnectionError
+            pendiente += trozo
+        mostrados = None           # None = sin respuesta completa (VLC sin video abierto u ocupado)
+        if FIN in pendiente:
+            bloque, _, pendiente = pendiente.rpartition(FIN)
+            m = patron.findall(bloque)
+            mostrados = int(m[-1]) if m else 0
+        pendiente = pendiente[-65536:]
+        sin_respuesta = sin_respuesta + 1 if mostrados is None else 0
+
+        if estatica_visible and mostrados:
+            avisar(signal.SIGUSR1, f"VLC muestra imagen ({mostrados} cuadros): ocultar estática")
+            estatica_visible = False
+        elif not estatica_visible and (mostrados == 0 or sin_respuesta >= 3):
+            avisar(signal.SIGUSR2, "VLC sin imagen (cambio de video): mostrar estática")
+            estatica_visible = True
+        time.sleep(0.1)
+except (OSError, ConnectionError):
+    avisar(signal.SIGUSR2, "VLC se cerró: mostrar estática")

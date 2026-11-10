@@ -1,0 +1,3271 @@
+#!/usr/bin/python3
+"""minitv: programa principal de la Mini TV (Pi Zero 2 W + ILI9341 320x240 vía fbcp-ili9341).
+
+Flujo: encender -> tubo -> estática -> menú. Al elegir una serie: estática, "CH 02 · Los Simpson"
+arriba a la derecha y el episodio continúa donde se quedó. Si nadie toca nada en el menú durante
+MENU_REANUDAR_SEG segundos, se reanuda la última serie vista.
+
+Juegos: en el menú, Juegos -> consola -> juego. Estática con "Cargando…" mientras arranca RetroArch
+(núcleos ligeros, ~/juegos/<consola>); al salir (botón 1 corto, Esc o Select+Start) vuelve a la lista.
+
+Capas del firmware (de abajo arriba):
+  -127   /dev/fb0: aquí se dibuja el menú (con Pillow, directo a 320x240, sin escritorio)
+  -1/0   RetroArch (driver dispmanx): fondo negro y la imagen del juego
+     1   video de VLC (MMAL); el rótulo del canal va justo encima (marq de VLC)
+  10000  minitv-estatica: tubo de encendido y estática "sintonizando" (se muestra/oculta con señales)
+  10001  minitv-estatica apagado: animación de apagado tipo tubo
+
+Órdenes (por el socket /run/minitv/control.sock; ver minitv-control):
+  arriba, abajo, elegir, menu, apagar, girar+, girar-
+  Del control remoto del teléfono (minitv-remoto), según lo que se esté viendo:
+  sube, baja, izquierda, derecha, ok, atras, inicio, pausa, stop, vol+, vol-, encendido
+  (encendido: reposo con la animación de tubo / encender; el estado va a /run/minitv/remoto.json)
+"""
+import json
+import math
+import mmap
+import os
+import queue
+import random
+import re
+import signal
+import socket
+import subprocess
+import threading
+import time
+import unicodedata
+import urllib.parse
+
+from PIL import Image, ImageChops, ImageDraw, ImageFont
+
+# =============================================================================================
+# Configuración
+# =============================================================================================
+
+
+def leer_conf(ruta):
+    conf = {}
+    try:
+        with open(ruta) as f:
+            for linea in f:
+                linea = linea.strip()
+                if linea and not linea.startswith("#") and "=" in linea:
+                    clave, valor = linea.split("=", 1)
+                    conf[clave.strip()] = valor.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return conf
+
+
+CONF = leer_conf(os.environ.get("MINITV_CONF", "/etc/default/minitv"))
+VIDEO_DIR = CONF.get("VIDEO_DIR", "/home/paolo/videos")
+LOGOS_DIR = os.path.join(VIDEO_DIR, "logos")   # logos de los canales de TV: "<Canal>.png" (si no hay, el nombre)
+AUDIO = CONF.get("AUDIO", "no") == "yes"
+AUDIO_DEVICE = CONF.get("AUDIO_DEVICE", "default")
+AUDIO_GAIN = float(CONF.get("AUDIO_GAIN", "1.0"))
+ESPERA_REANUDAR = float(CONF.get("MENU_REANUDAR_SEG", "10"))
+
+
+def gpio_conf(clave):
+    v = CONF.get(clave, "").split("#")[0].strip()
+    return int(v) if v.isdigit() else None
+
+
+BOTON1_GPIO = gpio_conf("BOTON1_GPIO")    # corto: menu      mantenido 2 s: apagar
+BOTON2_GPIO = gpio_conf("BOTON2_GPIO")    # corto: abajo     mantenido 0,8 s: elegir
+
+RUN = os.environ.get("RUNTIME_DIRECTORY", "/run/minitv")
+SOCK_CONTROL = os.path.join(RUN, "control.sock")
+SOCK_VLC = os.path.join(RUN, "vlc.sock")
+ESTADO = os.path.expanduser("~/.local/state/minitv/estado.json")
+ESTATICA = "/usr/local/bin/minitv-estatica"
+ROTULO_PROG = "/usr/local/bin/minitv-rotulo"   # rótulo con transparencia que se desvanece (categoría TV)
+RELOJ_SINCRONIZADO = "/run/systemd/timesync/synchronized"   # lo crea systemd-timesyncd al sincronizar por NTP
+SPOTIFY_DIR = "/run/raspotify"                 # eventos de Spotify Connect (minitv-spotify-evento)
+BT_AUDIO = "minitv_spotify"                    # salida del audio del teléfono (con el límite de -6 dB)
+# Emparejar mandos de Nintendo Switch (se muestra en Ajustes → Bluetooth → Buscar)
+AYUDA_JOYCON = ("Joy-Con / Mando Pro: mantén presionado el botón pequeño",
+                "del costado hasta que las luces corran")
+SIN_SENAL = "/usr/local/share/minitv/sin-senal.mp4"
+LOGO_ARRANQUE = "/usr/local/share/minitv/logo-arranque.rgb"   # lo usa minitv-estatica
+LOGO_MENU = "/usr/local/share/minitv/logo-menu.png"
+EXTENSIONES = (".mp4", ".m4v", ".mov", ".mkv")
+FUENTE = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+FUENTE_NEGRITA = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Juegos: ~/juegos/<consola> (los envía enviar-juegos desde la Mac) y RetroArch con núcleos ligeros
+JUEGOS_DIR = CONF.get("JUEGOS_DIR", "/home/paolo/juegos")
+# Consolas que se agrandan a toda la pantalla (escala no entera, sin deformar) en vez de 1x con bordes
+JUEGOS_AJUSTAR = CONF.get("JUEGOS_AJUSTAR", "gba").split()
+RETROARCH = CONF.get("RETROARCH", "/usr/local/bin/retroarch")
+RETROARCH_CFG = "/usr/local/share/minitv/retroarch.cfg"
+NUCLEOS_DIR = "/usr/local/lib/libretro"
+RETROARCH_PUERTO = 55355                     # network_cmd_port de retroarch.cfg
+ROTULO = os.path.join(os.environ.get("RUNTIME_DIRECTORY", "/run/minitv"), "rotulo.rgba")  # lo lee minitv-estatica
+CARTUCHO = (".zip",)
+# Portadas (~/juegos/<consola>/portadas/<juego>.png): enviar-juegos las reduce en la Mac a este máximo
+PORTADA_W, PORTADA_H = 118, 128
+#            carpeta    nombre en el menú     núcleo          extensiones
+CONSOLAS = (("gb",      "Game Boy",          "gambatte",     (".gb",) + CARTUCHO),
+            ("gbc",     "Game Boy Color",    "gambatte",     (".gbc", ".gb") + CARTUCHO),
+            ("gba",     "Game Boy Advance",  "gpsp",         (".gba",) + CARTUCHO),
+            ("nes",     "NES",               "fceumm",       (".nes",) + CARTUCHO),
+            ("snes",    "Super Nintendo",    "snes9x2005",   (".sfc", ".smc") + CARTUCHO),
+            ("genesis", "Sega Genesis",      "picodrive",    (".md", ".gen", ".smd", ".bin") + CARTUCHO),
+            ("psx",     "PlayStation",       "pcsx_rearmed", (".cue", ".chd", ".pbp", ".m3u", ".exe")),
+            # Arcade: romsets de FinalBurn Neo; el nombre real (p. ej. "The Simpsons") está en nombres.txt
+            ("arcade",  "Arcade",            "fbneo",        (".zip",)))
+
+W, H = 320, 240
+
+
+def ahora():
+    return time.monotonic()
+
+
+def log(*partes):
+    print(f"[{time.clock_gettime(time.CLOCK_MONOTONIC):.3f}]", *partes, flush=True)
+
+
+# =============================================================================================
+# Series (una carpeta por serie: "02 Los Simpson") y memoria de dónde se quedó cada una
+# =============================================================================================
+
+
+def orden_natural(texto):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", texto)]
+
+
+def capitulo(archivo):
+    """'Los Simpsons 4x20 - El día del Garrote.mp4' -> '4x20'."""
+    m = re.search(r"(\d+)x(\d+)", archivo)
+    if m:
+        return f"{int(m.group(1))}x{int(m.group(2)):02d}"
+    m = re.match(r"\s*(\d+)\s*([A-Za-z])?\s*-", archivo)     # '01 A - El rescate de Lula.avi' -> '01A'
+    if m:
+        return f"{int(m.group(1)):02d}{(m.group(2) or '').upper()}"
+    return os.path.splitext(archivo)[0][:16]
+
+
+def titulo_episodio(archivo):
+    """'Los Simpsons 4x20 - El día del Garrote.mp4' -> 'El día del Garrote';
+    '01 A - El rescate de Lula.mp4' -> 'El rescate de Lula'."""
+    base = os.path.splitext(archivo)[0]
+    m = re.search(r"\d+x\d+\s*-\s*(.+)$", base) or re.match(r"\s*\d+\s*[A-Za-z]?\s*-\s*(.+)$", base)
+    return m.group(1).strip() if m else base
+
+
+def mm_ss(segundos):
+    return f"{int(segundos) // 60}:{int(segundos) % 60:02d}"
+
+
+class Serie:
+    def __init__(self, carpeta):
+        self.carpeta = carpeta
+        self.id = os.path.basename(carpeta)
+        m = re.match(r"\s*(\d+)\s+(.+)", self.id)
+        self.canal = int(m.group(1)) if m else 0
+        self.nombre = m.group(2).strip() if m else self.id
+        try:
+            archivos = os.listdir(carpeta)
+        except OSError:
+            archivos = []
+        self.episodios = sorted((f for f in archivos if f.lower().endswith(EXTENSIONES) and not f.startswith(".")),
+                                key=orden_natural)
+
+    @property
+    def rotulo(self):
+        return f"CH {self.canal:02d} · {self.nombre}"
+
+
+def buscar_series():
+    try:
+        nombres = os.listdir(VIDEO_DIR)
+    except OSError:
+        return []
+    series = [Serie(os.path.join(VIDEO_DIR, n)) for n in nombres
+              if os.path.isdir(os.path.join(VIDEO_DIR, n)) and not n.startswith(".")
+              and n != os.path.basename(LOGOS_DIR)]
+    return sorted(series, key=lambda s: (s.canal, orden_natural(s.nombre)))
+
+
+class Consola:
+    """Una carpeta de ~/juegos (p. ej. 'snes') con sus juegos."""
+
+    def __init__(self, id_, nombre, nucleo, extensiones):
+        self.id, self.nombre, self.extensiones = id_, nombre, extensiones
+        self.carpeta = os.path.join(JUEGOS_DIR, id_)
+        self.nucleo = os.path.join(NUCLEOS_DIR, f"{nucleo}_libretro.so")
+        try:
+            archivos = [f for f in os.listdir(self.carpeta)
+                        if f.lower().endswith(extensiones) and not f.startswith(".")]
+        except OSError:
+            archivos = []
+        # PlayStation: los discos que ya nombra una lista .m3u (juegos de varios CD) no se repiten
+        en_listas = set()
+        for f in archivos:
+            if f.lower().endswith(".m3u"):
+                try:
+                    with open(os.path.join(self.carpeta, f), errors="replace") as m3u:
+                        en_listas.update(os.path.basename(l.strip()) for l in m3u if l.strip())
+                except OSError:
+                    pass
+        self.juegos = sorted((f for f in archivos if f not in en_listas), key=orden_natural)
+        # Títulos reales (arcade: "simpsons" -> "The Simpsons (4 Players World, set 1)"), los escribe enviar-juegos
+        self.nombres = {}
+        try:
+            with open(os.path.join(self.carpeta, "nombres.txt"), errors="replace") as f:
+                for linea in f:
+                    if "\t" in linea:
+                        corto, largo = linea.rstrip("\n").split("\t", 1)
+                        self.nombres[corto] = largo
+        except OSError:
+            pass
+
+    def estado_guardado(self, juego):
+        """Ruta del estado automático de RetroArch (donde continuar), o None.
+        Están en ~/juegos/estados/<emulador>/<juego sin extensión>.state.auto"""
+        base = os.path.splitext(juego)[0] + ".state.auto"
+        raiz = os.path.join(JUEGOS_DIR, "estados")
+        try:
+            carpetas = os.listdir(raiz)
+        except OSError:
+            return None
+        for d in carpetas:
+            ruta = os.path.join(raiz, d, base)
+            if os.path.isfile(ruta):
+                return ruta
+        return None
+
+    def fecha_guardado(self, juego):
+        ruta = self.estado_guardado(juego)
+        return time.strftime("%d/%m %H:%M", time.localtime(os.path.getmtime(ruta))) if ruta else None
+
+    def titulo(self, juego):
+        """Nombre para mostrar en el menú."""
+        largo = self.nombres.get(os.path.splitext(juego)[0])
+        if largo:
+            return re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", largo).strip() or largo
+        return titulo_juego(juego)
+
+
+def titulo_juego(archivo):
+    """'Super Boss Gaiden (World) [!].sfc' -> 'Super Boss Gaiden'."""
+    base = os.path.splitext(archivo)[0]
+    limpio = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", base).strip()
+    return limpio or base
+
+
+def buscar_consolas():
+    """Solo las consolas que tienen algún juego."""
+    consolas = (Consola(*c) for c in CONSOLAS)
+    return [c for c in consolas if c.juegos]
+
+
+class Estado:
+    """Última serie vista, volumen y, por serie, episodio y segundo donde se quedó.
+    También el último juego de cada consola."""
+
+    def __init__(self):
+        self.datos = {"ultima": None, "volumen": 100, "series": {}, "juegos": {}}
+        try:
+            with open(ESTADO) as f:
+                self.datos.update(json.load(f))
+        except (OSError, ValueError):
+            pass
+
+    def guardar(self):
+        os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+        tmp = ESTADO + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.datos, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, ESTADO)
+
+    def de(self, serie):
+        return self.datos["series"].get(serie.id, {})
+
+    def recordar(self, serie, episodio, segundo):
+        self.datos["series"][serie.id] = {"episodio": episodio, "segundo": int(segundo)}
+        self.datos["ultima"] = serie.id
+
+    def seguir(self, serie):
+        """(índice del episodio, segundo) donde continuar."""
+        if not serie.episodios:
+            return 0, 0
+        d = self.de(serie)
+        if d.get("episodio") in serie.episodios:
+            return serie.episodios.index(d["episodio"]), max(0, int(d.get("segundo", 0)) - 3)
+        return 0, 0
+
+
+# =============================================================================================
+# Estática (capa encima de VLC) y pantalla del menú (/dev/fb0)
+# =============================================================================================
+
+
+class Estatica:
+    def __init__(self):
+        self._quitar_rotulo()
+        self.proc = subprocess.Popen([ESTATICA, "encendido"])
+        self.visible = True
+        self.con_rotulo = False
+
+    def mostrar(self, rotulo=None):
+        """rotulo: imagen RGBA 320x240 que minitv-estatica mezcla encima (p. ej. 'Cargando…')."""
+        cambio = rotulo is not None or self.con_rotulo
+        if rotulo is not None:
+            tmp = ROTULO + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(rotulo.tobytes())
+            os.replace(tmp, ROTULO)
+            self.con_rotulo = True
+        elif self.con_rotulo:
+            self._quitar_rotulo()
+            self.con_rotulo = False
+        if (not self.visible or cambio) and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGUSR2)      # al recibirla vuelve a leer el rótulo
+        self.visible = True
+
+    def ocultar(self):
+        if self.visible and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGUSR1)
+        self.visible = False
+        if self.con_rotulo:
+            self._quitar_rotulo()
+            self.con_rotulo = False
+
+    @staticmethod
+    def _quitar_rotulo():
+        try:
+            os.unlink(ROTULO)
+        except OSError:
+            pass
+
+    def cerrar(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+class Framebuffer:
+    def __init__(self):
+        leer = lambda n: open(f"/sys/class/graphics/fb0/{n}").read().strip()
+        self.bpp = int(leer("bits_per_pixel"))
+        self.paso = int(leer("stride"))
+        self.ancho, self.alto = (int(v) for v in leer("virtual_size").split(","))
+        self.fd = os.open("/dev/fb0", os.O_RDWR)
+        self.mem = mmap.mmap(self.fd, self.paso * self.alto)
+
+    def mostrar(self, img):
+        datos = img.tobytes("raw", "BGRX")          # fb0 es XRGB8888 (en memoria: B, G, R, X)
+        fila = W * 4
+        if self.paso == fila:
+            self.mem[:len(datos)] = datos
+        else:
+            for y in range(H):
+                self.mem[y * self.paso:y * self.paso + fila] = datos[y * fila:(y + 1) * fila]
+
+    def negro(self):
+        self.mem[:] = bytes(len(self.mem))
+
+
+# =============================================================================================
+# VLC con su interfaz de control rc (para saber episodio, segundo y si ya hay imagen)
+# =============================================================================================
+
+
+class VLC:
+    def __init__(self, items, audio=True, rotulo=None, volumen=100, bucle=False):
+        """items: lista de (ruta, segundo_inicial)."""
+        args = ["cvlc", "--intf", "dummy", "--extraintf", "oldrc", "--rc-unix", SOCK_VLC, "--rc-fake-tty",
+                "--fullscreen", "--no-osd", "--no-video-title-show",
+                "--vout", "mmal_vout", "--no-mmal-adjust-refreshrate", "--codec", "mmal,any"]
+        if audio and AUDIO:
+            args += ["--aout", "alsa", "--alsa-audio-device", AUDIO_DEVICE, "--gain", str(AUDIO_GAIN)]
+        else:
+            args += ["--no-audio"]
+        if rotulo:
+            args += ["--sub-source", "marq", "--marq-marquee", rotulo, "--marq-position", "6",
+                     "--marq-x", "6", "--marq-y", "5", "--marq-size", "13", "--marq-timeout", "6000",
+                     "--marq-color", "0xFFFFFF", "--marq-opacity", "235",
+                     "--freetype-font", "DejaVu Sans", "--freetype-outline-thickness", "2"]
+        args += ["--loop"] if bucle else ["--play-and-exit"]
+        for ruta, segundo in items:
+            args.append(ruta)
+            if segundo:
+                args.append(f":start-time={int(segundo)}")
+        try:
+            os.unlink(SOCK_VLC)
+        except OSError:
+            pass
+        self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+        self.t_inicio = ahora()
+        self.sock = None
+        self.buf = b""
+        self.eventos = []
+        self.volumen = volumen
+        self.volumen_aplicado = False
+
+    def vivo(self):
+        return self.proc.poll() is None
+
+    def conectar(self):
+        if self.sock:
+            return True
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.connect(SOCK_VLC)
+            s.setblocking(False)
+            self.sock = s
+        except OSError:
+            return False
+        return True
+
+    def _leer(self, espera=0.0):
+        """Lee lo disponible (hasta 'espera' s). Recoge los avisos de 'new input'."""
+        limite = ahora() + espera
+        while True:
+            try:
+                trozo = self.sock.recv(8192)
+                if not trozo:
+                    raise ConnectionError
+                self.buf += trozo
+            except BlockingIOError:
+                if ahora() >= limite:
+                    break
+                time.sleep(0.01)
+        fin = 0
+        for m in re.finditer(rb"new input: (\S+) \)", self.buf):
+            ruta = urllib.parse.unquote(m.group(1).decode("utf-8", "replace").replace("file://", ""))
+            self.eventos.append(os.path.basename(ruta))
+            fin = m.end()
+        if fin:
+            self.buf = self.buf[fin:]               # no volver a contar los mismos avisos
+
+    def consulta(self, orden, patron, espera=0.3):
+        """Envía una orden y devuelve el primer grupo de 'patron' en la respuesta (o None)."""
+        if not self.conectar():
+            return None
+        try:
+            self._leer()
+            self.buf = b""
+            self.sock.sendall(orden.encode() + b"\n")
+            limite = ahora() + espera
+            while ahora() < limite:
+                self._leer(0.02)
+                m = re.search(patron, self.buf, re.M)
+                if m:
+                    return m.group(1)
+        except (OSError, ConnectionError):
+            self.sock = None
+        return None
+
+    def cuadros_mostrados(self):
+        r = self.consulta("stats", rb"frames displayed\s*:\s*(\d+)")
+        return int(r) if r is not None else None
+
+    def segundo(self):
+        r = self.consulta("get_time", rb"^\s*(\d+)\s*$")
+        return int(r) if r is not None else None
+
+    def poner_volumen(self, porcentaje):
+        self.volumen = porcentaje
+        if self.conectar():
+            try:
+                self.sock.sendall(f"volume {round(porcentaje * 2.56)}\n".encode())
+                self.volumen_aplicado = True
+            except OSError:
+                self.sock = None
+
+    def pausa(self):
+        """Pausa / sigue (la orden "pause" de VLC alterna)."""
+        if self.conectar():
+            try:
+                self.sock.sendall(b"pause\n")
+                self.en_pausa = not getattr(self, "en_pausa", False)
+            except OSError:
+                self.sock = None
+
+    def nuevos_episodios(self):
+        if self.sock:
+            try:
+                self._leer()
+            except (OSError, ConnectionError):
+                self.sock = None
+        ev, self.eventos = self.eventos, []
+        self.buf = self.buf[-4096:]
+        return ev
+
+    def cerrar(self):
+        if self.vivo():
+            self.proc.terminate()
+            try:
+                self.proc.wait(2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.sock:
+            self.sock.close()
+
+
+class Reproduccion:
+    """Una serie en pantalla: continúa donde se quedó y avanza en orden por los episodios."""
+
+    def __init__(self, serie, estado, estatica, inicio=None):
+        """inicio: (índice de episodio, segundo); por defecto, donde se quedó la serie."""
+        self.serie, self.estado, self.estatica = serie, estado, estatica
+        i, seg = inicio if inicio is not None else estado.seguir(serie)
+        eps = serie.episodios
+        orden = eps[i:] + eps[:i]
+        items = [(os.path.join(serie.carpeta, e), seg if k == 0 else 0) for k, e in enumerate(orden)]
+        # Toda la serie, empezando por el episodio guardado, en bucle
+        self.vlc = VLC(items, rotulo=serie.rotulo, volumen=estado.datos.get("volumen", 100), bucle=True)
+        self.episodio, self.seg = eps[i], seg
+        self.primer_aviso = True
+        self.esperando_imagen = True
+        self.t_consulta = self.t_guardado = ahora()
+        estado.recordar(serie, self.episodio, self.seg)
+        log(f"Ver {serie.rotulo}: {self.episodio} desde el segundo {seg}")
+
+    def tick(self):
+        """Devuelve 'fin' si VLC terminó, si no None."""
+        if not self.vlc.vivo():
+            return "fin"
+        if not self.vlc.conectar():
+            return None
+        if not self.vlc.volumen_aplicado:
+            self.vlc.poner_volumen(self.vlc.volumen)
+        for ep in self.vlc.nuevos_episodios():
+            if self.primer_aviso and ep == self.episodio:   # aviso del episodio con el que arranca
+                self.primer_aviso = False
+                continue
+            self.primer_aviso = False
+            log(f"Nuevo episodio: {ep}")
+            self.estatica.mostrar()              # estática entre episodios, hasta que haya imagen
+            self.esperando_imagen = True
+            self.episodio, self.seg = ep, 0
+        t = ahora()
+        if self.esperando_imagen:
+            n = self.vlc.cuadros_mostrados()
+            if n:
+                log(f"VLC muestra imagen ({n} cuadros): ocultar estática")
+                self.estatica.ocultar()
+                self.esperando_imagen = False
+        elif t - self.t_consulta >= 1.0:
+            self.t_consulta = t
+            s = self.vlc.segundo()
+            if s is not None:
+                self.seg = s
+        if t - self.t_guardado >= 5.0:
+            self.t_guardado = t
+            self.estado.recordar(self.serie, self.episodio, self.seg)
+            self.estado.guardar()
+        return None
+
+    def volumen(self, delta):
+        v = max(0, min(100, self.vlc.volumen + delta))
+        self.vlc.poner_volumen(v)
+        self.estado.datos["volumen"] = v
+        log(f"Volumen {v}%")
+
+    def parar(self):
+        s = self.vlc.segundo() if self.vlc.vivo() else None
+        if s is not None:
+            self.seg = s
+        self.estado.recordar(self.serie, self.episodio, self.seg)
+        self.estado.guardar()
+        self.vlc.cerrar()
+        log(f"Guardado {self.serie.rotulo}: {self.episodio} en el segundo {self.seg}")
+
+
+class CanalTV:
+    """Categoría TV: un canal en vivo. "Todo" (canal=None) mezcla todas las series; los canales de
+    ~/videos/canales.txt (Cartoon Network, Nickelodeon...) solo las suyas. Episodios al azar, sin
+    repetir hasta haber pasado por todos (vistos por canal en estado.json). No toca el "Seguir".
+    En pantalla: rótulo arriba a la derecha al empezar cada episodio, la mosca del canal abajo a la
+    derecha (siempre) y "Más adelante: ..." abajo a la izquierda (al empezar y en el último minuto).
+    Misma interfaz que Reproduccion."""
+
+    SEGUNDOS_ROTULO = 3.0
+    SEGUNDOS_PROXIMO = 8.0
+    PROXIMO_TRAS = 6.0          # "Más adelante" a los 6 s de empezar el episodio...
+    PROXIMO_FINAL = 60          # ...y otra vez en el último minuto
+
+    def __init__(self, series, estado, estatica, dibujos, canal=None):
+        """dibujos: el Menú (rotulo_tv, mosca_tv, proximo_tv). canal: nombre o None (= Todo)."""
+        self.canal = canal
+        self.nombre_canal = canal or "TV"
+        self.series = {s.id: s for s in series if s.episodios}
+        self.estado, self.estatica, self.dibujos = estado, estatica, dibujos
+        self.capas = {}                 # "rotulo" / "mosca" / "proximo" -> proceso minitv-rotulo
+        self.actual = None              # "id_serie/episodio" que se está viendo
+        self.mosca_de = None            # canal cuya mosca está puesta (en "Todo" cambia con la serie)
+        self.vlc = None
+        self._lanzar()
+
+    def _memoria(self):
+        if self.canal is None:
+            return self.estado.datos.setdefault("tv", {})
+        return self.estado.datos.setdefault("tv_canales", {}).setdefault(self.canal, {})
+
+    def _mazo(self):
+        """Episodios que faltan en esta vuelta, barajados (si no queda ninguno, empieza otra vuelta)."""
+        tv = self._memoria()
+        todos = [f"{sid}/{e}" for sid, s in self.series.items() for e in s.episodios]
+        vistos = tv.get("vistos", [])
+        pendientes = [x for x in todos if x not in set(vistos)]
+        if not pendientes:
+            log(f"{self.nombre_canal}: se vieron todos los episodios; empieza otra vuelta")
+            tv["vistos"], pendientes = [], todos
+        random.shuffle(pendientes)
+        if len(pendientes) > 1 and vistos and pendientes[0] == vistos[-1]:   # sin repetir el último
+            pendientes.append(pendientes.pop(0))
+        return pendientes
+
+    def _lanzar(self):
+        self.mazo = self._mazo()
+        items = [(os.path.join(self.series[c.split("/", 1)[0]].carpeta, c.split("/", 1)[1]), 0) for c in self.mazo]
+        self.vlc = VLC(items, volumen=self.estado.datos.get("volumen", 100), bucle=False)
+        self.estatica.mostrar()
+        self.esperando_imagen = True
+        self.actual = None
+        log(f"{self.nombre_canal}: {len(self.mazo)} episodios por ver en esta vuelta")
+
+    # ----- capas de texto encima del video (minitv-rotulo) -----
+    def _capa(self, nombre, img, x, y, segundos):
+        # El firmware lee la imagen con filas de un múltiplo de 16 píxeles: si el ancho no lo es, cada
+        # fila sale corrida y la imagen se ve rayada. Se rellena con transparente hacia el lado libre.
+        falta = -img.width % 16
+        if falta:
+            ancha = Image.new("RGBA", (img.width + falta, img.height), (0, 0, 0, 0))
+            izquierda = x - falta >= 0 and x + img.width > W // 2      # pegado a la derecha: rellenar a la izquierda
+            ancha.paste(img, (falta if izquierda else 0, 0))
+            img, x = ancha, (x - falta if izquierda else x)
+        ruta = os.path.join(RUN, f"rotulo-{nombre}.rgba")
+        with open(ruta, "wb") as f:
+            f.write(img.tobytes())
+        self._quitar(nombre)
+        if os.path.exists(ROTULO_PROG):
+            self.capas[nombre] = subprocess.Popen([ROTULO_PROG, ruta, str(img.width), str(img.height),
+                                                   str(x), str(y), str(segundos)])
+
+    def _quitar(self, nombre=None):
+        for n in ([nombre] if nombre else list(self.capas)):
+            p = self.capas.pop(n, None)
+            if p and p.poll() is None:
+                p.terminate()
+
+    def _texto(self, item):
+        sid, ep = item.split("/", 1)
+        return f"{self.series[sid].nombre} {capitulo(ep)}"
+
+    def _al_empezar_episodio(self):
+        img = self.dibujos.rotulo_tv(f"{self.nombre_canal} · {self._texto(self.actual)}")
+        self._capa("rotulo", img, W - img.width - 6, 6, self.SEGUNDOS_ROTULO)
+        # La mosca queda puesta todo el rato. En "Todo", la del canal de la serie que se está viendo.
+        canal = self._canal_mosca()
+        m = self.capas.get("mosca")
+        if canal != self.mosca_de or (canal and (m is None or m.poll() is not None)):
+            self._quitar("mosca")
+            self.mosca_de = canal
+            if canal:
+                img = self.dibujos.mosca_tv(canal)
+                x = 5 if self._mosca_izquierda() else W - img.width - 5
+                self._capa("mosca", img, x, H - img.height - 5, 86400)
+        self.t_episodio = self.t_consulta = ahora()
+        self.duracion = None
+        self.proximo_inicio = self.proximo_final = False
+
+    def info(self):
+        """Botón OK del control remoto: vuelve a mostrar qué se ve y qué viene."""
+        if self.actual:
+            img = self.dibujos.rotulo_tv(f"{self.nombre_canal} · {self._texto(self.actual)}")
+            self._capa("rotulo", img, W - img.width - 6, 6, self.SEGUNDOS_ROTULO)
+            self._proximo()
+
+    def _proximo(self):
+        if self.mazo:
+            img = self.dibujos.proximo_tv(self._texto(self.mazo[0]))
+            x = W - img.width - 6 if self._mosca_izquierda() else 6     # en el lado contrario a la mosca
+            self._capa("proximo", img, x, H - img.height - 6, self.SEGUNDOS_PROXIMO)
+
+    def _canal_mosca(self):
+        """El canal de la mosca: el elegido o, en "Todo", el primero de canales.txt con esta serie."""
+        if self.canal or not self.actual:
+            return self.canal
+        sid = self.actual.split("/", 1)[0]
+        for nombre, suyas in leer_canales(list(self.series.values())):
+            if any(s.id == sid for s in suyas):
+                return nombre
+        return None
+
+    def _mosca_izquierda(self):
+        """canales.txt: "mosca: izquierda" debajo del [Canal] la pone abajo a la izquierda."""
+        return bool(self.mosca_de) and \
+            getattr(leer_canales, "opciones", {}).get(self.mosca_de, {}).get("mosca") == "izquierda"
+
+    def tick(self):
+        """Devuelve 'fin' si VLC falló, si no None. Al terminar el mazo, baraja otra vuelta."""
+        if not self.vlc.vivo():
+            if ahora() - self.vlc.t_inicio < 5:
+                return "fin"
+            self._quitar("rotulo")
+            self._quitar("proximo")
+            self._lanzar()
+            return None
+        if not self.vlc.conectar():
+            return None
+        if not self.vlc.volumen_aplicado:
+            self.vlc.poner_volumen(self.vlc.volumen)
+        for ep in self.vlc.nuevos_episodios():
+            i = next((k for k, c in enumerate(self.mazo) if c.split("/", 1)[1] == ep), None)
+            if i is None:
+                continue
+            if self.actual is not None:                 # cambio de episodio: estática hasta que haya imagen
+                self._quitar("rotulo")
+                self._quitar("proximo")
+                self.estatica.mostrar()
+                self.esperando_imagen = True
+            self._empieza(i)
+        if self.esperando_imagen:
+            n = self.vlc.cuadros_mostrados()
+            if n:
+                if self.actual is None and self.mazo:
+                    # El aviso del primer episodio llegó antes de conectarse a VLC (pasa si VLC arranca
+                    # lento): es el primero del mazo, que es lo primero que reproduce
+                    self._empieza(0)
+                self.estatica.ocultar()
+                self.esperando_imagen = False
+                if self.actual:
+                    self._al_empezar_episodio()
+        elif self.actual:
+            t = ahora()
+            if not self.proximo_inicio and t - self.t_episodio >= self.PROXIMO_TRAS:
+                self.proximo_inicio = True
+                self._proximo()
+            if not self.proximo_final and t - self.t_consulta >= 3:
+                self.t_consulta = t
+                if self.duracion is None:
+                    d = self.vlc.consulta("get_length", rb"^\s*(\d+)\s*$")
+                    self.duracion = int(d) if d else None
+                s = self.vlc.segundo()
+                if self.duracion and s is not None and self.duracion - s <= self.PROXIMO_FINAL:
+                    self.proximo_final = True
+                    self._proximo()
+        return None
+
+    def _empieza(self, i):
+        self.actual, self.mazo = self.mazo[i], self.mazo[i + 1:]
+        self._memoria().setdefault("vistos", []).append(self.actual)
+        self.estado.guardar()
+        log(f"{self.nombre_canal}: {self.actual}")
+
+    def volumen(self, delta):
+        v = max(0, min(100, self.vlc.volumen + delta))
+        self.vlc.poner_volumen(v)
+        self.estado.datos["volumen"] = v
+        log(f"Volumen {v}%")
+
+    def parar(self):
+        self._quitar()
+        self.vlc.cerrar()
+        self.estado.guardar()
+        log(f"{self.nombre_canal}: fin")
+
+
+def leer_canales(series, _cache={}):
+    """Canales de ~/videos/canales.txt: [(nombre, [Serie...])], solo los que tienen series con episodios.
+    Se relee si el archivo cambia."""
+    ruta = os.path.join(VIDEO_DIR, "canales.txt")
+    try:
+        fecha = os.path.getmtime(ruta)
+    except OSError:
+        return []
+    if _cache.get("fecha") != fecha:
+        canales, actual, opciones = [], None, {}
+        try:
+            with open(ruta, encoding="utf-8", errors="replace") as f:
+                for linea in f:
+                    linea = unicodedata.normalize("NFC", linea.strip())
+                    if not linea or linea.startswith("#"):
+                        continue
+                    if linea.startswith("[") and linea.endswith("]"):
+                        actual = (linea[1:-1].strip(), [])
+                        canales.append(actual)
+                    elif actual and linea.lower().replace(" ", "").startswith("mosca:"):
+                        opciones[actual[0]] = {"mosca": linea.split(":", 1)[1].strip().lower()}
+                    elif actual:
+                        actual[1].append(linea.lower())
+        except OSError:
+            canales = []
+        _cache.update(fecha=fecha, canales=canales, opciones=opciones)
+    leer_canales.opciones = _cache.get("opciones", {})
+    por_nombre = {unicodedata.normalize("NFC", s.nombre).lower(): s for s in series if s.episodios}
+    out = []
+    for nombre, nombres in _cache["canales"]:
+        suyas = [por_nombre[n] for n in nombres if n in por_nombre]
+        if suyas:
+            out.append((nombre, suyas))
+    return out
+
+
+# =============================================================================================
+# Juegos: RetroArch (capa dispmanx 0, debajo de la estática) controlado por UDP
+# =============================================================================================
+
+
+class Partida:
+    """Un juego en pantalla. RetroArch guarda la batería y un estado automático al salir con QUIT."""
+
+    ESPERA_IMAGEN = 0.35      # tras 'PLAYING', margen para que el primer cuadro llegue a la pantalla
+    MAX_CARGA = 30.0          # si en este tiempo no dice 'PLAYING', se quita la estática igual
+
+    def __init__(self, consola, juego, estado, estatica, nuevo=False):
+        self.consola, self.juego, self.estado, self.estatica = consola, juego, estado, estatica
+        extra = os.path.join(RUN, "retroarch-extra.cfg")
+        vol = estado.datos.get("volumen", 100)
+        with open(extra, "w") as f:
+            if not AUDIO or vol <= 0:
+                f.write('audio_mute_enable = "true"\n')
+            else:   # el mismo límite que VLC (AUDIO_GAIN) por el volumen del menú, en dB
+                f.write(f'audio_volume = "{20 * math.log10(AUDIO_GAIN * vol / 100):.1f}"\n')
+            if consola.id in JUEGOS_AJUSTAR:     # p. ej. GBA 240x160 -> 320x213 (1,33x)
+                f.write('video_scale_integer = "false"\n')
+            if nuevo:                           # "Empezar de nuevo": no cargar el estado (al salir se guarda el nuevo)
+                f.write('savestate_auto_load = "false"\n')
+        for sub in ("partidas", "estados", "bios"):
+            os.makedirs(os.path.join(JUEGOS_DIR, sub), exist_ok=True)
+        args = [RETROARCH, "--verbose", "--config", RETROARCH_CFG, "--appendconfig", extra,
+                "-L", consola.nucleo, os.path.join(consola.carpeta, juego)]
+        self.registro = open(os.path.join(RUN, "retroarch.log"), "w")     # en /run (RAM): para diagnosticar
+        self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=self.registro, stderr=subprocess.STDOUT)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        self.t_inicio = ahora()
+        self.t_consulta = 0
+        self.t_jugando = None
+        self.esperando_imagen = True
+        estado.datos["juegos"][consola.id] = juego
+        estado.datos["juegos"]["ultima_consola"] = consola.id
+        estado.guardar()
+        log(f"Jugar {consola.nombre}: {juego}")
+
+    def vivo(self):
+        return self.proc.poll() is None
+
+    def orden(self, texto):
+        try:
+            self.sock.sendto(texto.encode(), ("127.0.0.1", RETROARCH_PUERTO))
+        except OSError:
+            pass
+
+    def situacion(self):
+        """'PLAYING', 'PAUSED', 'CONTENTLESS'... o None si RetroArch aún no responde."""
+        try:
+            while True:
+                self.sock.recv(512)                 # descartar respuestas viejas
+        except (BlockingIOError, OSError):
+            pass
+        self.orden("GET_STATUS")
+        limite = ahora() + 0.05
+        while ahora() < limite:
+            try:
+                r = self.sock.recv(512).decode("utf-8", "replace").split()
+                return r[1] if len(r) > 1 and r[0] == "GET_STATUS" else None
+            except BlockingIOError:
+                time.sleep(0.005)
+            except OSError:
+                return None
+        return None
+
+    def tick(self):
+        """Devuelve 'fin' si RetroArch terminó, si no None."""
+        if not self.vivo():
+            return "fin"
+        if self.esperando_imagen:
+            t = ahora()
+            if self.t_jugando is None and t - self.t_consulta >= 0.15:
+                self.t_consulta = t
+                if self.situacion() == "PLAYING":
+                    self.t_jugando = t
+                    log(f"RetroArch jugando ({t - self.t_inicio:.1f} s)")
+            listo = self.t_jugando is not None and t - self.t_jugando >= self.ESPERA_IMAGEN
+            if listo or t - self.t_inicio > self.MAX_CARGA:
+                self.estatica.ocultar()
+                self.esperando_imagen = False
+        return None
+
+    def volumen(self, delta):
+        v = max(0, min(100, self.estado.datos.get("volumen", 100) + delta))
+        self.estado.datos["volumen"] = v
+        self.orden("VOLUME_UP" if delta > 0 else "VOLUME_DOWN")
+        log(f"Volumen {v}% (juego)")
+
+    def parar(self):
+        """QUIT: RetroArch guarda la partida y sale solo; si no, se le termina."""
+        if self.vivo():
+            self.orden("QUIT")
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                log("RetroArch no salió con QUIT: terminar")
+                self.proc.terminate()
+                try:
+                    self.proc.wait(3)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        self.sock.close()
+        self.registro.close()
+        log(f"Fin del juego {self.juego} (código {self.proc.returncode})")
+
+
+# =============================================================================================
+# Menú (estilo años 2000)
+# =============================================================================================
+
+def rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+FONDO = rgb("0d1b3d")
+GRIS_AZUL = rgb("c9d6f5")
+CELESTE = rgb("7fd0ff")
+AZUL_GRIS = rgb("8ea3d6")
+GEL = rgb("2a6fd6")
+GEL_BORDE = rgb("9fdcff")
+BLANCO = (255, 255, 255)
+ONDA_1 = rgb("142a5e")
+ONDA_2 = rgb("1b3772")
+
+
+def mezcla(a, b, k):
+    """Color a mezclado hacia b en proporción k (0..1)."""
+    return tuple(round(x + (y - x) * k) for x, y in zip(a, b))
+
+
+def recortar(d, texto, fuente, ancho_max):
+    """Recorta el texto con '…' para que quepa en ancho_max píxeles."""
+    if d.textsize(texto, font=fuente)[0] <= ancho_max:
+        return texto
+    while texto and d.textsize(texto + "…", font=fuente)[0] > ancho_max:
+        texto = texto[:-1]
+    return texto.rstrip() + "…"
+
+
+def suavizar(t):
+    return 1 - (1 - t) ** 3     # ease-out
+
+
+def rect_redondeado(d, caja, r, relleno, borde=None):
+    """Rectángulo con esquinas redondeadas (Pillow 8.1 no trae rounded_rectangle)."""
+    x0, y0, x1, y1 = caja
+    d.rectangle((x0 + r, y0, x1 - r, y1), fill=relleno)
+    d.rectangle((x0, y0 + r, x1, y1 - r), fill=relleno)
+    for cx, cy, a in ((x0, y0, 180), (x1 - 2 * r, y0, 270), (x1 - 2 * r, y1 - 2 * r, 0), (x0, y1 - 2 * r, 90)):
+        d.pieslice((cx, cy, cx + 2 * r, cy + 2 * r), a, a + 90, fill=relleno)
+        if borde:
+            d.arc((cx, cy, cx + 2 * r, cy + 2 * r), a, a + 90, fill=borde)
+    if borde:
+        d.line((x0 + r, y0, x1 - r, y0), fill=borde)
+        d.line((x0 + r, y1, x1 - r, y1), fill=borde)
+        d.line((x0, y0 + r, x0, y1 - r), fill=borde)
+        d.line((x1, y0 + r, x1, y1 - r), fill=borde)
+
+
+def boton_gel(ancho, alto, radio=10, s=3):
+    """Botón 'gel': azul con degradado, brillo arriba, borde celeste y esquinas redondeadas.
+    Se dibuja a s veces el tamaño y se reduce, para bordes suaves (Pillow 8.1 no tiene rounded_rectangle)."""
+    A, B, R = ancho * s, alto * s, radio * s
+
+    def mascara(margen, r):
+        m = Image.new("L", (A, B), 0)
+        d = ImageDraw.Draw(m)
+        x0, y0, x1, y1 = margen, margen, A - 1 - margen, B - 1 - margen
+        d.rectangle((x0 + r, y0, x1 - r, y1), fill=255)
+        d.rectangle((x0, y0 + r, x1, y1 - r), fill=255)
+        for cx, cy in ((x0, y0), (x1 - 2 * r, y0), (x0, y1 - 2 * r), (x1 - 2 * r, y1 - 2 * r)):
+            d.ellipse((cx, cy, cx + 2 * r, cy + 2 * r), fill=255)
+        return m
+
+    img = Image.new("RGBA", (A, B), GEL_BORDE + (0,))
+    img.putalpha(mascara(0, R))
+    # Interior: degradado vertical (más claro arriba)
+    degradado = Image.new("RGBA", (A, B))
+    dg = ImageDraw.Draw(degradado)
+    arriba, abajo = mezcla(GEL, BLANCO, 0.18), mezcla(GEL, (0, 0, 0), 0.22)
+    for y in range(B):
+        dg.line((0, y, A, y), fill=mezcla(arriba, abajo, y / B) + (255,))
+    img.paste(degradado, (0, 0), mascara(int(1.4 * s), R - int(1.4 * s)))
+    # Brillo: blanco translúcido arriba que se desvanece hacia la mitad del botón
+    alto_brillo = int(B * 0.55)
+    degradado_brillo = Image.new("L", (A, B), 0)
+    db = ImageDraw.Draw(degradado_brillo)
+    for y in range(alto_brillo):
+        db.line((0, y, A, y), fill=int(90 * (1 - y / alto_brillo) ** 1.6))
+    brillo = Image.new("RGBA", (A, B), (255, 255, 255, 0))
+    brillo.putalpha(ImageChops.multiply(mascara(int(2.5 * s), R - int(2.5 * s)), degradado_brillo))
+    img = Image.alpha_composite(img, brillo)
+    return img.resize((ancho, alto), Image.LANCZOS)
+
+
+class Menu:
+    CATEGORIAS = ["TV", "Juegos", "Música", "Series", "USB", "Ajustes"]
+    Y_LISTA = 74            # parte superior del botón seleccionado
+    ALTO_GEL = 44
+    PASO = 26               # separación entre los elementos que siguen
+    DURACION_ANIM = 0.15    # la selección se desliza en 150 ms
+    ANCHO_LISTA_JUEGOS = 168   # lista de juegos: ~55 % del ancho; a la derecha, la portada
+
+    def __init__(self, tv):
+        self.tv = tv
+        f = lambda tam, negrita=False: ImageFont.truetype(FUENTE_NEGRITA if negrita else FUENTE, tam)
+        self.f_barra, self.f_cat, self.f_cat_act = f(11), f(11), f(15, True)
+        self.f_item, self.f_sel, self.f_sub, self.f_aviso = f(13), f(15, True), f(10), f(10)
+        self.f_rotulo = f(12, True)
+        self.f_mosca = f(10, True)
+        self.f_proximo = f(11)
+        self.f_codigo = f(36, True)
+        self.gel = boton_gel(W - 32, self.ALTO_GEL)
+        self.gel_estrecho = boton_gel(self.ANCHO_LISTA_JUEGOS, self.ALTO_GEL)
+        self.portadas = {}       # ruta -> (fecha del archivo, imagen con borde y esquinas, lista para pegar)
+        try:   # logo pequeño (ya compuesto sobre el fondo del menú por generar-logo.py)
+            self.logo = Image.open(LOGO_MENU).convert("RGB")
+        except OSError:
+            self.logo = None
+        self.cat = self.CATEGORIAS.index("Series")
+        self.serie_abierta = None   # serie cuya lista de episodios se está mostrando
+        self.consola_abierta = None  # consola cuya lista de juegos se está mostrando
+        self.juego_abierto = None    # juego con partida guardada: Continuar / Empezar de nuevo / Borrar
+        self.remoto_pantalla = False  # Ajustes → Control remoto (QR); cualquier botón la cierra
+        self._red_cache = (0, None)
+        self.bt_pantalla = None      # Ajustes → Bluetooth: "inicio", "buscar", "guardados" o "dispositivo"
+        self.bt_mac = None           # dispositivo guardado elegido (pantalla "dispositivo")
+        self.foco = 0           # -1 = fila de categorías; 0.. = elemento de la lista
+        self.pos = 0.0           # posición animada de la selección
+        self.anim = None         # (desde, hasta, t0)
+        self.fondo = None
+        self.t_fondo = 0
+
+    # ----- contenido -----
+    def elementos(self):
+        if self.bt_pantalla:
+            return self._elementos_bt()
+        if self.serie_abierta:                    # lista de episodios de una serie
+            s = self.serie_abierta
+            i, _ = self.tv.estado.seguir(s)
+            guardado = self.tv.estado.de(s).get("segundo", 0) if self.tv.estado.de(s).get("episodio") else 0
+            actual = s.episodios[i]
+            out = [(f"▶ Continuar {capitulo(actual)}", f"{titulo_episodio(actual)} · desde {mm_ss(guardado)}")]
+            for k, e in enumerate(s.episodios):
+                out.append((f"{capitulo(e)} · {titulo_episodio(e)}",
+                            "En curso" if k == i else f"Episodio {k + 1} de {len(s.episodios)}"))
+            return out
+        if self.consola_abierta:                  # lista de juegos de una consola
+            c = self.consola_abierta
+            if self.juego_abierto:                # un juego con partida guardada: qué hacer
+                fecha = c.fecha_guardado(self.juego_abierto) or "?"
+                return [("▶ Continuar", f"Guardado el {fecha}"),
+                        ("Empezar de nuevo", "Desde la pantalla de título"),
+                        ("Borrar partida", "Quita el punto para continuar")]
+            ultimo = self.tv.estado.datos["juegos"].get(c.id)
+            out = []
+            for k, j in enumerate(c.juegos):
+                fecha = c.fecha_guardado(j)
+                sub = f"Partida guardada · {fecha}" if fecha else f"Juego {k + 1} de {len(c.juegos)}"
+                out.append((c.titulo(j), ("Último jugado · " + fecha) if j == ultimo and fecha else sub))
+            return out
+        c = self.CATEGORIAS[self.cat]
+        if c == "TV":
+            con_eps = [s for s in self.tv.series if s.episodios]
+            if not con_eps:
+                return []
+            out = [("Todo", f"Todas las series al azar · {len(con_eps)} series")]
+            for nombre, suyas in leer_canales(self.tv.series):
+                out.append((nombre, " · ".join(s.nombre for s in suyas)))
+            return out
+        if c == "Música":
+            out = []
+            f = self.tv.musica_activa()
+            if f:
+                estado = "Sonando" if f.sonando() else "En pausa"
+                out.append(("▶ Ahora suena", f"{estado} · {f.nombre} · {f.artistas}"))
+            tel = self.tv.telefono.dispositivo
+            out.append(("Conectar un teléfono", f"Conectado: {tel}" if tel
+                        else "La TV aparece como «Mini TV» en su Bluetooth"))
+            return out
+        if c == "Juegos":
+            out = []
+            for con in self.tv.consolas:
+                n = len(con.juegos)
+                ultimo = self.tv.estado.datos["juegos"].get(con.id)
+                sub = f"{n} juego{'s' if n != 1 else ''}"
+                if ultimo in con.juegos:
+                    sub += f" · Último: {con.titulo(ultimo)}"
+                out.append((con.nombre, sub))
+            return out
+        if c == "Series":
+            out = []
+            for s in self.tv.series:
+                if s.episodios:
+                    i, _ = self.tv.estado.seguir(s)
+                    out.append((s.nombre, f"Seguir: {capitulo(s.episodios[i])}"))
+                else:
+                    out.append((s.nombre, "Sin episodios"))
+            return out
+        if c == "Ajustes":
+            return [("Volumen", f"Nivel: {self.tv.estado.datos.get('volumen', 100)}%  (elegir para cambiar)"),
+                    ("Bluetooth", "Teclados, mandos y parlantes"),
+                    ("Control remoto", "Usa tu celular como control y como mando"),
+                    ("Apagar la TV", "Elegir para apagar")]
+        return []
+
+    def abrir_serie(self, serie):
+        self.serie_abierta = serie
+        self.foco, self.pos, self.anim = 0, 0.0, None
+
+    def cerrar_serie(self):
+        s, self.serie_abierta = self.serie_abierta, None
+        self.seleccionar_serie(s.id)
+
+    def abrir_consola(self, consola):
+        self.consola_abierta = consola
+        self.juego_abierto = None
+        ultimo = self.tv.estado.datos["juegos"].get(consola.id)
+        self.foco = consola.juegos.index(ultimo) if ultimo in consola.juegos else 0
+        self.pos, self.anim = float(self.foco), None
+
+    def cerrar_consola(self):
+        if self.juego_abierto:                    # de la lista Continuar/Empezar: volver a los juegos
+            c = self.consola_abierta
+            j, self.juego_abierto = self.juego_abierto, None
+            self.foco = c.juegos.index(j) if j in c.juegos else 0
+            self.pos, self.anim = float(self.foco), None
+            return
+        c, self.consola_abierta = self.consola_abierta, None
+        ids = [x.id for x in self.tv.consolas]
+        self.foco = ids.index(c.id) if c.id in ids else (0 if ids else -1)
+        self.pos, self.anim = float(max(self.foco, 0)), None
+
+    def seleccionar_juego(self, consola_id):
+        """Al volver de un juego: la lista de juegos de esa consola, con el foco en el último."""
+        if self.bt_pantalla:
+            self.salir_bt()
+        self.serie_abierta = None
+        self.cat = self.CATEGORIAS.index("Juegos")
+        con = next((c for c in self.tv.consolas if c.id == consola_id), None)
+        if con:
+            self.abrir_consola(con)
+        else:
+            self.consola_abierta = None
+            self.foco, self.pos, self.anim = (0 if self.tv.consolas else -1), 0.0, None
+
+    def en_juegos(self):
+        return self.consola_abierta is not None or (self.CATEGORIAS[self.cat] == "Juegos"
+                                                     and not self.serie_abierta)
+
+    def seleccionar_tv(self):
+        if self.bt_pantalla:
+            self.salir_bt()
+        self.serie_abierta = self.consola_abierta = None
+        self.cat = self.CATEGORIAS.index("TV")
+        canales = [n for n, _ in leer_canales(self.tv.series)]
+        ultimo = self.tv.estado.datos.get("ultimo_canal")
+        self.foco = canales.index(ultimo) + 1 if ultimo in canales else 0
+        self.pos, self.anim = float(self.foco), None
+
+    def seleccionar_serie(self, serie_id):
+        if self.bt_pantalla:
+            self.salir_bt()
+        self.serie_abierta = None
+        self.consola_abierta = None
+        self.cat = self.CATEGORIAS.index("Series")
+        ids = [s.id for s in self.tv.series]
+        self.foco = ids.index(serie_id) if serie_id in ids else (0 if ids else -1)
+        self.pos = float(max(self.foco, 0))
+        self.anim = None
+
+    # ----- navegación -----
+    def _mover(self, nuevo):
+        if nuevo >= 0 and self.foco >= 0:
+            self.anim = (self.pos, float(nuevo), ahora())
+        else:
+            self.pos = float(max(nuevo, 0))
+            self.anim = None
+        self.foco = nuevo
+
+    def abajo(self):
+        n = len(self.elementos())
+        if self.serie_abierta or self.consola_abierta or self.bt_pantalla:   # en listas: vuelve al principio
+            if n:
+                self._mover((self.foco + 1) % n)
+            return
+        self._mover(0 if self.foco == -1 and n else (self.foco + 1 if 0 <= self.foco < n - 1 else -1))
+
+    def arriba(self):
+        n = len(self.elementos())
+        if self.serie_abierta or self.consola_abierta or self.bt_pantalla:
+            if n:
+                self._mover((self.foco - 1) % n)
+            return
+        self._mover(n - 1 if self.foco == -1 and n else (self.foco - 1 if self.foco > 0 else -1))
+
+    def elegir(self):
+        """Devuelve la acción a realizar."""
+        if self.bt_pantalla:
+            return self._elegir_bt()
+        if self.serie_abierta:
+            if self.foco == 0:
+                return ("ver", self.serie_abierta)                       # continuar donde quedó
+            return ("ver_episodio", self.serie_abierta, self.foco - 1)  # ese episodio desde el principio
+        if self.consola_abierta:
+            c = self.consola_abierta
+            if not os.path.exists(c.nucleo):
+                return ("aviso", f"Falta el núcleo de {c.nombre}")
+            if self.juego_abierto:
+                j = self.juego_abierto
+                if self.foco == 0:
+                    return ("jugar", c, j)
+                if self.foco == 1:
+                    return ("jugar_nuevo", c, j)
+                ruta = c.estado_guardado(j)
+                if ruta:
+                    os.unlink(ruta)
+                    log(f"Partida borrada: {ruta}")
+                self.cerrar_consola()
+                return ("aviso", f"Partida borrada: {c.titulo(j)}")
+            j = c.juegos[self.foco]
+            if c.estado_guardado(j):              # tiene partida: preguntar qué hacer
+                self.juego_abierto = j
+                self.foco, self.pos, self.anim = 0, 0.0, None
+                return None
+            return ("jugar", c, j)
+        if self.foco == -1:                     # en la fila de categorías: pasar a la siguiente
+            self.cat = (self.cat + 1) % len(self.CATEGORIAS)
+            self.pos, self.anim = 0.0, None
+            if self.CATEGORIAS[self.cat] == "Juegos":
+                self.tv.consolas = buscar_consolas()      # por si llegaron juegos nuevos
+            return None
+        c = self.CATEGORIAS[self.cat]
+        if c == "TV" and self.foco >= 0:
+            canales = [n for n, _ in leer_canales(self.tv.series)]
+            return ("ver_tv", canales[self.foco - 1] if 1 <= self.foco <= len(canales) else None)
+        if c == "Música" and self.foco >= 0:
+            items = self.elementos()
+            nombre = items[self.foco][0] if self.foco < len(items) else ""
+            if nombre.startswith("▶"):
+                return ("ahora_suena",)
+            if nombre == "Conectar un teléfono":
+                self.tv.bt.hacer_visible()
+            return None
+        if c == "Juegos" and self.foco < len(self.tv.consolas):
+            return ("abrir_consola", self.tv.consolas[self.foco])
+        if c == "Series" and self.foco < len(self.tv.series):
+            s = self.tv.series[self.foco]
+            return ("abrir_serie", s) if s.episodios else ("ver", s)
+        if c == "Ajustes":
+            if self.foco == 1:
+                self.abrir_bt()
+                return None
+            if self.foco == 2:
+                self.remoto_pantalla = True
+                return None
+            return ("volumen_ciclo",) if self.foco == 0 else ("apagar",)
+        return None
+
+    def animando(self):
+        return self.anim is not None
+
+    def dentro(self):
+        """True si hay una lista abierta (episodios, juegos, Bluetooth): ◀ del control = atrás."""
+        return bool(self.serie_abierta or self.consola_abierta or self.bt_pantalla)
+
+    def lado(self, d):
+        """Flechas ◀ ▶ del control remoto en la portada: categoría anterior / siguiente."""
+        self.cat = (self.cat + d) % len(self.CATEGORIAS)
+        if self.CATEGORIAS[self.cat] == "Juegos":
+            self.tv.consolas = buscar_consolas()
+        self.foco = 0 if self.elementos() else -1
+        self.pos, self.anim = float(max(self.foco, 0)), None
+
+    def inicio(self):
+        """Botón Menú del control remoto dentro del menú: cierra listas y vuelve a la portada."""
+        self.remoto_pantalla = False
+        if self.bt_pantalla:
+            self.salir_bt()
+        self.serie_abierta = self.consola_abierta = None
+        self.juego_abierto = None
+        self.foco = 0 if self.elementos() else -1
+        self.pos, self.anim = float(max(self.foco, 0)), None
+
+    # ----- Ajustes → Control remoto -----
+    def _red(self):
+        """(modo, ssid, clave, ip) de la red; se relee cada 5 s."""
+        t, datos = self._red_cache
+        if datos and ahora() - t < 5:
+            return datos
+        conf = {"SSID": "MiniTV", "CLAVE": "", "IP": "192.168.4.1"}
+        try:
+            with open("/etc/minitv/red-propia.conf", encoding="utf-8") as f:
+                for linea in f:
+                    if "=" in linea and not linea.lstrip().startswith("#"):
+                        k, v = linea.strip().split("=", 1)
+                        conf[k] = v.strip().strip('"')
+        except OSError:
+            pass
+        try:
+            with open("/run/minitv-red/modo") as f:
+                modo = f.read().strip()
+        except OSError:
+            modo = "casa"
+        try:
+            ip = subprocess.run(["/sbin/ip", "-4", "-o", "addr", "show", "wlan0"], capture_output=True,
+                                text=True, timeout=2).stdout.split()
+            ip = ip[ip.index("inet") + 1].split("/")[0] if "inet" in ip else ""
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            ip = ""
+        datos = (modo, conf["SSID"], conf["CLAVE"], ip or (conf["IP"] if modo == "propia" else ""))
+        self._red_cache = (ahora(), datos)
+        return datos
+
+    @staticmethod
+    def _qr(texto, lado):
+        """Código QR (blanco con módulos oscuros) de lado <= 'lado' píxeles, nítido (múltiplo entero)."""
+        import qrcode
+        q = qrcode.QRCode(border=2, box_size=1, error_correction=qrcode.constants.ERROR_CORRECT_L)
+        q.add_data(texto)
+        q.make(fit=True)
+        im = q.make_image(fill_color="black", back_color="white").convert("RGB")
+        k = max(1, lado // im.width)
+        return im.resize((im.width * k, im.height * k), Image.NEAREST)
+
+    def _panel_remoto(self, img, d):
+        modo, ssid, clave, ip = self._red()
+        d.rectangle((0, 30, W, H), fill=FONDO)
+        d.text((14, 36), "Control remoto", font=self.f_sel, fill=BLANCO)
+        url = f"http://{ip}" if ip else "http://minitv.local"
+        if modo == "propia":
+            def esc(t):
+                return "".join("\\" + c if c in '\\;,:"' else c for c in t)
+            for x, texto, titulo in ((14, f"WIFI:T:WPA;S:{esc(ssid)};P:{esc(clave)};;", "1. Únete a la red"),
+                                     (166, url, "2. Abre el control")):
+                qr = self._qr(texto, 104)
+                img.paste(qr, (x + (140 - qr.width) // 2, 78))
+                tw = d.textsize(titulo, font=self.f_sub)[0]
+                d.text((x + (140 - tw) // 2, 62), titulo, font=self.f_sub, fill=CELESTE)
+            lineas = [(f"Red «{ssid}»  ·  clave: {clave}", BLANCO), (f"Control: {url}  o  http://minitv.local", GRIS_AZUL)]
+            y = 190
+        else:
+            qr = self._qr(url, 120)
+            img.paste(qr, (14, 64))
+            x = 14 + qr.width + 12
+            lineas = [("Escanéalo con la cámara", CELESTE), ("del celular, o abre:", CELESTE),
+                      ("http://minitv.local", BLANCO), (url if ip else "", GRIS_AZUL), ("", BLANCO),
+                      ("Sin el wifi de casa, la TV", GRIS_AZUL), (f"crea su red «{ssid}»", GRIS_AZUL),
+                      (f"clave: {clave}", BLANCO)]
+            for i, (t, color) in enumerate(lineas):
+                d.text((x, 66 + i * 15), recortar(d, t, self.f_sub, W - x - 8), font=self.f_sub, fill=color)
+            lineas, y = [], 0
+        for i, (t, color) in enumerate(lineas):
+            tw = d.textsize(t, font=self.f_sub)[0]
+            d.text(((W - tw) // 2, y + i * 15), t, font=self.f_sub, fill=color)
+        t = "Cualquier botón: volver"
+        d.text((W - d.textsize(t, font=self.f_aviso)[0] - 10, 40), t, font=self.f_aviso, fill=GRIS_AZUL)
+
+    # ----- dibujo -----
+    def _fondo(self, t):
+        """Fondo azul noche con dos ondas suaves que se mueven muy lento (se recalcula a 10 fps)."""
+        if self.fondo is not None and t - self.t_fondo < 0.1:
+            return self.fondo
+        img = Image.new("RGB", (W, H), FONDO)
+        d = ImageDraw.Draw(img)
+        for color, base, amp, largo, vel, fase in ((ONDA_1, 192, 9, 0.022, 0.25, 0.0),
+                                                  (ONDA_2, 206, 7, 0.031, -0.18, 1.7)):
+            puntos = [(x, base + amp * math.sin(x * largo + t * vel + fase)
+                       + 3 * math.sin(x * largo * 2.3 - t * vel * 0.7)) for x in range(0, W + 8, 8)]
+            d.polygon(puntos + [(W, H), (0, H)], fill=color)
+        # Barra superior
+        if self.logo:
+            img.paste(self.logo, (6, 1))
+        else:
+            d.text((8, 8), "Mini TV", font=self.f_barra, fill=GRIS_AZUL)
+        # Sin internet el reloj no se sincroniza (la Pi no tiene pila): mejor "--:--" que una hora equivocada
+        hora = time.strftime("%H:%M") if os.path.exists(RELOJ_SINCRONIZADO) else "--:--"
+        d.text((W - 8 - d.textsize(hora, font=self.f_barra)[0], 8), hora, font=self.f_barra, fill=GRIS_AZUL)
+        d.line((8, 29, W - 8, 29), fill=mezcla(FONDO, GRIS_AZUL, 0.18))
+        self.fondo, self.t_fondo = img, t
+        return img
+
+    def dibujar(self, aviso=None):
+        t = ahora()
+        if self.anim:
+            desde, hasta, t0 = self.anim
+            k = min(1.0, (t - t0) / self.DURACION_ANIM)
+            self.pos = desde + (hasta - desde) * suavizar(k)
+            if k >= 1:
+                self.anim = None
+        img = self._fondo(t).copy()
+        d = ImageDraw.Draw(img)
+
+        if self.serie_abierta:
+            self._cabecera_serie(d)
+        elif self.consola_abierta:
+            self._cabecera_consola(d)
+        elif self.bt_pantalla:
+            self._cabecera_bt(d)
+        else:
+            self._categorias(d)
+
+        # Lista
+        items = self.elementos()
+        if items and self.foco >= len(items):          # la lista se acortó (p. ej. Bluetooth)
+            self.foco, self.pos, self.anim = len(items) - 1, float(len(items) - 1), None
+        items = self.elementos()
+        # En la lista de juegos: lista a la izquierda (~55 %) y la portada del juego a la derecha
+        con_portada = self.consola_abierta is not None
+        gel = self.gel_estrecho if con_portada else self.gel
+        ancho_max = gel.width - 24
+        es_tv = (not self.serie_abierta and not self.consola_abierta and not self.bt_pantalla
+                 and self.CATEGORIAS[self.cat] == "TV")
+        if not items:
+            texto = (self._vacio_bt() if self.bt_pantalla else
+                     "Sin juegos todavía (usa enviar-juegos)" if self.en_juegos() else "Próximamente")
+            tw, th = d.textsize(texto, font=self.f_item)
+            d.text(((W - tw) // 2, 118), texto, font=self.f_item, fill=AZUL_GRIS)
+        else:
+            if self.foco >= 0:
+                img.paste(gel, (16, self.Y_LISTA), gel)
+            if con_portada and (self.juego_abierto or 0 <= self.foco < len(self.consola_abierta.juegos)):
+                self._portada(img, d, self.consola_abierta,
+                              self.juego_abierto or self.consola_abierta.juegos[self.foco])
+            for i, (nombre, sub) in enumerate(items):
+                dist = i - (self.pos if self.foco >= 0 else -1)
+                if dist < -0.6:
+                    continue
+                if dist <= 1:
+                    y = self.Y_LISTA + dist * (self.ALTO_GEL + 8)
+                else:
+                    y = self.Y_LISTA + self.ALTO_GEL + 8 + (dist - 1) * self.PASO
+                if y > 196:
+                    break
+                if es_tv:
+                    self._fila_canal(img, d, nombre, sub, int(y), dist, i == 0)
+                elif self.foco >= 0 and abs(dist) < 0.5:
+                    d.text((28, y + 6), recortar(d, nombre, self.f_sel, ancho_max), font=self.f_sel, fill=BLANCO)
+                    d.text((29, y + 26), recortar(d, sub, self.f_sub, ancho_max), font=self.f_sub,
+                           fill=mezcla(GEL, BLANCO, 0.8))
+                else:
+                    # texto simple que se va apagando hacia abajo
+                    k = max(0.12, 0.85 - 0.22 * max(0.0, dist - 1)) if dist >= 0 else max(0.0, 1 + dist) * 0.6
+                    d.text((28, y + 12), recortar(d, nombre, self.f_item, ancho_max), font=self.f_item,
+                           fill=mezcla(FONDO, GRIS_AZUL, k))
+
+        if aviso:
+            tw, _ = d.textsize(aviso, font=self.f_aviso)
+            d.text(((W - tw) // 2, H - 16), aviso, font=self.f_aviso, fill=GRIS_AZUL)
+        if self.remoto_pantalla:
+            self._panel_remoto(img, d)
+        elif self.bt_pantalla:
+            self._paneles_bt(d)
+        elif self.tv.bt.visible() or (self.tv.bt.mensaje and ahora() < self.tv.bt.mensaje[1]):
+            self._panel_visible(d)
+        return img
+
+    def _panel_visible(self, d):
+        """Música → Conectar un teléfono: la TV visible como "Mini TV" (y el código si el teléfono lo pide)."""
+        bt = self.tv.bt
+        if bt.mensaje and ahora() < bt.mensaje[1]:
+            lineas = [(bt.mensaje[0], self.f_sel, CELESTE)]
+            if len(bt.mensaje) > 2 and bt.mensaje[2]:
+                lineas.append((bt.mensaje[2], self.f_sub, GRIS_AZUL))
+            self._panel(d, lineas)
+        elif bt.codigo:
+            self._panel(d, (("Confirma en el teléfono que el código es:", self.f_sub, GRIS_AZUL),
+                            (" ".join(bt.codigo), self.f_codigo, BLANCO),
+                            ("y toca «Vincular»", self.f_sub, CELESTE)), ancho=W - 40)
+        else:
+            resta = max(0, int(bt.visible_hasta - ahora()))
+            self._panel(d, (("Visible como «Mini TV»", self.f_sel, CELESTE),
+                            ("En tu teléfono: Ajustes → Bluetooth → Mini TV", self.f_sub, BLANCO),
+                            (f"Quedan {resta // 60}:{resta % 60:02d}", self.f_sub, GRIS_AZUL)), ancho=W - 32)
+
+    def _cabecera_serie(self, d):
+        """En la lista de episodios: nombre de la serie subrayado y cuántos episodios tiene."""
+        s = self.serie_abierta
+        d.text((20, 36), s.nombre, font=self.f_cat_act, fill=BLANCO)
+        ancho = d.textsize(s.nombre, font=self.f_cat_act)[0]
+        d.rectangle((20, 56, 20 + ancho, 57), fill=CELESTE)
+        info = f"CH {s.canal:02d} · {len(s.episodios)} episodios"
+        d.text((W - 20 - d.textsize(info, font=self.f_cat)[0], 40), info, font=self.f_cat, fill=AZUL_GRIS)
+
+    # ----- Ajustes → Bluetooth -----
+    def abrir_bt(self):
+        self.bt_pantalla, self.bt_mac = "inicio", None
+        self.foco, self.pos, self.anim = 0, 0.0, None
+        self.tv.bt.actualizar_guardados()
+
+    def _ir_bt(self, pantalla, foco=0):
+        self.bt_pantalla = pantalla
+        self.foco, self.pos, self.anim = foco, float(foco), None
+
+    def salir_bt(self):
+        """Deja Bluetooth (cierra la sesión de bluetoothctl) y vuelve a Ajustes."""
+        if self.bt_pantalla:
+            self.tv.bt.cerrar_sesion()
+        self.bt_pantalla = self.bt_mac = None
+        self.cat = self.CATEGORIAS.index("Ajustes")
+        self.foco, self.pos, self.anim = 1, 1.0, None
+
+    def volver_bt(self):
+        """Botón 1 dentro de Bluetooth: un nivel hacia atrás."""
+        bt = self.tv.bt
+        if bt.ocupado:
+            return                                   # mientras empareja/conecta, esperar
+        if self.bt_pantalla == "dispositivo":
+            macs = [d["mac"] for d in bt.guardados]
+            self._ir_bt("guardados", macs.index(self.bt_mac) if self.bt_mac in macs else 0)
+        elif self.bt_pantalla in ("buscar", "guardados"):
+            bt.dejar_de_buscar()
+            self._ir_bt("inicio", 0 if self.bt_pantalla == "buscar" else 1)
+        else:
+            self.salir_bt()
+
+    def _guardado(self):
+        return next((d for d in self.tv.bt.guardados if d["mac"] == self.bt_mac), None)
+
+    def _elementos_bt(self):
+        bt = self.tv.bt
+        if self.bt_pantalla == "inicio":
+            n = len(bt.guardados)
+            con = sum(1 for d in bt.guardados if d["conectado"])
+            return [("Buscar dispositivos", "Teclados, mandos y parlantes cercanos"),
+                    ("Dispositivos guardados", f"{n} guardado{'s' if n != 1 else ''} · {con} conectado{'s' if con != 1 else ''}")]
+        if self.bt_pantalla == "buscar":
+            return [(d["nombre"], f"{d['tipo'] or 'Consultando…'} · elegir para emparejar")
+                    for d in bt.lista_encontrados()]
+        if self.bt_pantalla == "guardados":
+            return [(d["nombre"] or d["mac"], f"{d['tipo']} · {'Conectado' if d['conectado'] else 'No conectado'}")
+                    for d in bt.guardados]
+        d = self._guardado()
+        if not d:
+            return []
+        return [("Desconectar" if d["conectado"] else "Conectar",
+                 f"{d['tipo']} · ahora {'conectado' if d['conectado'] else 'no conectado'}"),
+                ("Olvidar", "Quitarlo de la lista (habrá que volver a emparejarlo)")]
+
+    def _elegir_bt(self):
+        bt = self.tv.bt
+        if bt.ocupado or bt.codigo:
+            return None
+        if self.bt_pantalla == "inicio":
+            if self.foco == 0:
+                self._ir_bt("buscar")
+                bt.buscar()
+            else:
+                self._ir_bt("guardados")
+                bt.actualizar_guardados()
+        elif self.bt_pantalla == "buscar":
+            lista = bt.lista_encontrados()
+            if 0 <= self.foco < len(lista):
+                bt.emparejar(lista[self.foco]["mac"], lista[self.foco]["nombre"])
+        elif self.bt_pantalla == "guardados":
+            if 0 <= self.foco < len(bt.guardados):
+                self.bt_mac = bt.guardados[self.foco]["mac"]
+                self._ir_bt("dispositivo")
+        else:
+            d = self._guardado()
+            if d:
+                nombre = d["nombre"] or d["mac"]
+                if self.foco == 0:
+                    bt.accion(d["mac"], nombre, "desconectar" if d["conectado"] else "conectar")
+                else:
+                    bt.accion(d["mac"], nombre, "olvidar")
+                    self._ir_bt("guardados")
+        return None
+
+    def _vacio_bt(self):
+        if self.bt_pantalla == "buscar":
+            return "Buscando…" if self.tv.bt.buscando else "No se encontró nada"
+        if self.bt_pantalla == "guardados":
+            return "No hay dispositivos guardados"
+        return "Próximamente"
+
+    def _cabecera_bt(self, d):
+        if self.bt_pantalla == "dispositivo":
+            g = self._guardado()
+            titulo = (g["nombre"] or g["mac"]) if g else "Dispositivo"
+        else:
+            titulo = {"inicio": "Bluetooth", "buscar": "Buscar dispositivos",
+                      "guardados": "Dispositivos guardados"}[self.bt_pantalla]
+        titulo = recortar(d, titulo, self.f_cat_act, W - 120)
+        d.text((20, 36), titulo, font=self.f_cat_act, fill=BLANCO)
+        ancho = d.textsize(titulo, font=self.f_cat_act)[0]
+        d.rectangle((20, 56, 20 + ancho, 57), fill=CELESTE)
+        if self.bt_pantalla == "buscar" and self.tv.bt.buscando:
+            info = "Buscando" + "." * (1 + int(ahora() * 2) % 3)
+        elif self.bt_pantalla == "guardados":
+            info = f"{len(self.tv.bt.guardados)} guardados"
+        else:
+            info = "Bluetooth" if self.bt_pantalla == "dispositivo" else ""
+        d.text((W - 20 - d.textsize(info, font=self.f_cat)[0], 40), info, font=self.f_cat, fill=AZUL_GRIS)
+
+    def _panel(self, d, lineas, ancho=None):
+        """Panel centrado estilo gel oscuro con varias líneas (texto, fuente, color)."""
+        tam = [d.textsize(t, font=f) for t, f, _ in lineas]
+        ancho = ancho or max(w for w, _ in tam) + 40
+        alto = sum(h for _, h in tam) + 10 * (len(lineas) - 1) + 30
+        x0, y0 = (W - ancho) // 2, (H - alto) // 2 + 8
+        rect_redondeado(d, (x0, y0, x0 + ancho, y0 + alto), 10, mezcla(FONDO, (0, 0, 0), 0.25), GEL_BORDE)
+        y = y0 + 15
+        for (texto, fuente, color), (w, h) in zip(lineas, tam):
+            d.text(((W - w) // 2 + 1, y + 1), texto, font=fuente, fill=(0, 0, 0))
+            d.text(((W - w) // 2, y), texto, font=fuente, fill=color)
+            y += h + 10
+
+    def _paneles_bt(self, d):
+        bt = self.tv.bt
+        if bt.codigo:                                  # código grande para escribir en el teclado
+            codigo = " ".join(bt.codigo) if len(bt.codigo) <= 8 else bt.codigo
+            self._panel(d, (("Escribe en el teclado:", self.f_item, GRIS_AZUL),
+                            (codigo, self.f_codigo, BLANCO),
+                            ("y pulsa Enter", self.f_item, CELESTE)), ancho=W - 40)
+        elif bt.ocupado:
+            puntos = "." * (1 + int(ahora() * 2) % 3)
+            self._panel(d, ((bt.ocupado.rstrip("…") + puntos, self.f_sel, BLANCO),
+                            ("Espera un momento", self.f_sub, GRIS_AZUL)))
+        elif bt.mensaje and ahora() < bt.mensaje[1]:
+            texto, detalle = bt.mensaje[0], (bt.mensaje[2] if len(bt.mensaje) > 2 else None)
+            color = CELESTE if texto in ("Conectado", "Desconectado", "Olvidado") else (255, 170, 150)
+            lineas = [(texto, self.f_sel, color)]
+            if detalle:
+                lineas.append((detalle, self.f_sub, GRIS_AZUL))
+            self._panel(d, lineas)
+        elif self.bt_pantalla == "buscar":
+            # Instrucciones para los mandos de Nintendo Switch, abajo, mientras se busca
+            for k, linea in enumerate(AYUDA_JOYCON):
+                tw = d.textsize(linea, font=self.f_sub)[0]
+                d.text(((W - tw) // 2 + 1, 207 + 13 * k), linea, font=self.f_sub, fill=(0, 0, 0))
+                d.text(((W - tw) // 2, 206 + 13 * k), linea, font=self.f_sub, fill=GRIS_AZUL)
+
+    # ----- Música: pantalla "Ahora suena" -----
+    def _partir(self, d, texto, fuente, ancho, lineas_max):
+        """Parte un texto en líneas que quepan en 'ancho' (la última con … si no cabe)."""
+        palabras, out, actual = texto.split(), [], ""
+        for p in palabras:
+            prueba = f"{actual} {p}".strip()
+            if d.textsize(prueba, font=fuente)[0] <= ancho or not actual:
+                actual = prueba
+            else:
+                out.append(actual)
+                actual = p
+        if actual:
+            out.append(actual)
+        if len(out) > lineas_max:
+            out = out[:lineas_max - 1] + [" ".join(out[lineas_max - 1:])]
+        return [recortar(d, l, fuente, ancho) for l in out]
+
+    def dibujar_ahora_suena(self, sp, aviso=None):
+        t = ahora()
+        img = self._fondo(t).copy()
+        d = ImageDraw.Draw(img)
+        # Cabecera
+        d.text((20, 36), "Ahora suena", font=self.f_cat_act, fill=BLANCO)
+        ancho = d.textsize("Ahora suena", font=self.f_cat_act)[0]
+        d.rectangle((20, 56, 20 + ancho, 57), fill=CELESTE)
+        info = recortar(d, sp.origen, self.f_cat, W - 40 - ancho)
+        d.text((W - 20 - d.textsize(info, font=self.f_cat)[0], 40), info, font=self.f_cat, fill=AZUL_GRIS)
+        # Carátula a la izquierda: esquinas redondeadas y borde celeste fino
+        tam = Spotify.TAM_CARATULA
+        x0, y0 = 16, 70
+        caratula = sp.imagen_caratula()
+        marco = Image.new("RGBA", (tam + 2, tam + 2), (0, 0, 0, 0))
+        rect_redondeado(ImageDraw.Draw(marco), (0, 0, tam + 1, tam + 1), 9, CELESTE + (255,))
+        if caratula is None:                       # mientras baja (o sin internet): un disco
+            caratula = Image.new("RGB", (tam, tam), mezcla(FONDO, GRIS_AZUL, 0.10))
+            dc = ImageDraw.Draw(caratula)
+            c = tam // 2
+            for r, k in ((40, 0.30), (39, 0.16), (12, 0.45), (4, 0.10)):
+                dc.ellipse((c - r, c - r, c + r, c + r), fill=mezcla(FONDO, GRIS_AZUL, k))
+        mascara = Image.new("L", (tam, tam), 0)
+        rect_redondeado(ImageDraw.Draw(mascara), (0, 0, tam - 1, tam - 1), 8, 255)
+        marco.paste(caratula, (1, 1), mascara)
+        img.paste(marco, (x0, y0), marco)
+        # A la derecha: canción, artista, álbum, estado y barra de progreso celeste
+        xd, ancho_d = x0 + tam + 14, W - (x0 + tam + 14) - 16
+        y = y0 + 2
+        for linea in self._partir(d, sp.nombre or "…", self.f_sel, ancho_d, 2):
+            d.text((xd, y), linea, font=self.f_sel, fill=BLANCO)
+            y += 19
+        y += 3
+        d.text((xd, y), recortar(d, sp.artistas, self.f_item, ancho_d), font=self.f_item, fill=GRIS_AZUL)
+        y += 18
+        d.text((xd, y), recortar(d, sp.album, self.f_sub, ancho_d), font=self.f_sub, fill=AZUL_GRIS)
+        estado = {"playing": "▶ Sonando", "paused": "❚❚ En pausa", "loading": "Cargando…"}.get(sp.estado, "")
+        d.text((xd, y0 + 80), estado, font=self.f_sub, fill=CELESTE)
+        # Barra de progreso
+        yb = y0 + tam - 16
+        total, pos = sp.duracion_ms, sp.posicion_ms()
+        rect_redondeado(d, (xd, yb, xd + ancho_d, yb + 5), 2, mezcla(FONDO, GRIS_AZUL, 0.22))
+        if total:
+            lleno = max(5, int(ancho_d * pos / total))
+            rect_redondeado(d, (xd, yb, xd + lleno, yb + 5), 2, CELESTE)
+        t_pos, t_tot = mm_ss(pos / 1000), mm_ss(total / 1000)
+        d.text((xd, yb + 8), t_pos, font=self.f_sub, fill=GRIS_AZUL)
+        d.text((xd + ancho_d - d.textsize(t_tot, font=self.f_sub)[0], yb + 8), t_tot, font=self.f_sub,
+               fill=GRIS_AZUL)
+        texto = aviso or "Botón 1: volver a la TV (pausa la música)"
+        tw = d.textsize(texto, font=self.f_aviso)[0]
+        d.text(((W - tw) // 2, H - 16), texto, font=self.f_aviso, fill=GRIS_AZUL)
+        return img
+
+    def _portada(self, img, d, consola, juego):
+        """Portada del juego seleccionado, centrada en el hueco de la derecha. Las prepara enviar-juegos
+        en la Mac ya reducidas (máx. PORTADA_W x PORTADA_H): aquí solo se le ponen esquinas y borde."""
+        x0, y0 = 16 + self.ANCHO_LISTA_JUEGOS + 8, self.Y_LISTA - 6       # hueco: hasta W-8 y y=202
+        hueco_w, hueco_h = W - 8 - x0, 202 - y0
+        ruta = os.path.join(consola.carpeta, "portadas", os.path.splitext(juego)[0] + ".png")
+        try:
+            fecha = os.path.getmtime(ruta)
+        except OSError:
+            fecha = None
+        lista = self.portadas.get(ruta)
+        if fecha is not None and (lista is None or lista[0] != fecha):
+            try:
+                foto = Image.open(ruta).convert("RGB")
+                if foto.width > PORTADA_W or foto.height > PORTADA_H:     # por si llega una sin reducir
+                    foto.thumbnail((PORTADA_W, PORTADA_H), Image.LANCZOS)
+                marco = Image.new("RGBA", (foto.width + 2, foto.height + 2), (0, 0, 0, 0))
+                rect_redondeado(ImageDraw.Draw(marco), (0, 0, marco.width - 1, marco.height - 1), 7,
+                                CELESTE + (255,))                                    # borde celeste fino
+                mascara = Image.new("L", foto.size, 0)
+                rect_redondeado(ImageDraw.Draw(mascara), (0, 0, foto.width - 1, foto.height - 1), 6, 255)
+                marco.paste(foto, (1, 1), mascara)
+                lista = self.portadas[ruta] = (fecha, marco)
+            except OSError:
+                lista = None
+        if fecha is not None and lista:
+            marco = lista[1]
+            img.paste(marco, (x0 + (hueco_w - marco.width) // 2, y0 + (hueco_h - marco.height) // 2), marco)
+        else:   # sin portada: un hueco discreto con el nombre de la consola
+            w, h = 96, 110
+            x, y = x0 + (hueco_w - w) // 2, y0 + (hueco_h - h) // 2
+            rect_redondeado(d, (x, y, x + w, y + h), 7, mezcla(FONDO, GRIS_AZUL, 0.08), mezcla(FONDO, CELESTE, 0.45))
+            for texto, dy in ((consola.nombre, -8), ("sin portada", 8)):
+                t = recortar(d, texto, self.f_sub, w - 10)
+                tw, th = d.textsize(t, font=self.f_sub)
+                d.text((x + (w - tw) // 2, y + h // 2 + dy - th // 2), t, font=self.f_sub,
+                       fill=mezcla(FONDO, GRIS_AZUL, 0.6))
+
+    def _cabecera_consola(self, d):
+        """En la lista de juegos: nombre de la consola subrayado y cuántos juegos tiene."""
+        c = self.consola_abierta
+        titulo = recortar(d, c.titulo(self.juego_abierto), self.f_cat_act, W - 130) if self.juego_abierto else c.nombre
+        d.text((20, 36), titulo, font=self.f_cat_act, fill=BLANCO)
+        ancho = d.textsize(titulo, font=self.f_cat_act)[0]
+        d.rectangle((20, 56, 20 + ancho, 57), fill=CELESTE)
+        info = c.nombre if self.juego_abierto else f"{len(c.juegos)} juego{'s' if len(c.juegos) != 1 else ''}"
+        d.text((W - 20 - d.textsize(info, font=self.f_cat)[0], 40), info, font=self.f_cat, fill=AZUL_GRIS)
+
+    def rotulo_carga(self, consola, juego):
+        """'Cargando…' para mostrar encima de la estática mientras arranca el juego (RGBA 320x240)."""
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        titulo = recortar(d, consola.titulo(juego), self.f_item, W - 72)
+        lineas = (("Cargando…", self.f_sel, BLANCO), (titulo, self.f_item, GRIS_AZUL),
+                  (consola.nombre, self.f_sub, CELESTE))
+        tam = [d.textsize(t, font=f) for t, f, _ in lineas]
+        ancho = max(w for w, _ in tam) + 36
+        alto = sum(h for _, h in tam) + 10 * (len(lineas) - 1) + 28
+        x0, y0 = (W - ancho) // 2, (H - alto) // 2
+        rect_redondeado(d, (x0, y0, x0 + ancho, y0 + alto), 10, FONDO + (225,), GEL_BORDE + (255,))
+        y = y0 + 14
+        for (texto, fuente, color), (w, h) in zip(lineas, tam):
+            d.text(((W - w) // 2 + 1, y + 1), texto, font=fuente, fill=(0, 0, 0, 200))   # sombra
+            d.text(((W - w) // 2, y), texto, font=fuente, fill=color + (255,))
+            y += h + 10
+        return img
+
+    def rotulo_tv(self, texto):
+        """Rótulo de la categoría TV ('TV · Los Simpson 7x07'), del tamaño justo (RGBA)."""
+        medir = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        tw, th = medir.textsize(texto, font=self.f_rotulo)
+        img = Image.new("RGBA", (tw + 20, th + 12), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        rect_redondeado(d, (0, 0, img.width - 1, img.height - 1), 7, FONDO + (215,), GEL_BORDE + (255,))
+        d.text((11, 6), texto, font=self.f_rotulo, fill=(0, 0, 0, 200))       # sombra
+        d.text((10, 5), texto, font=self.f_rotulo, fill=BLANCO + (255,))
+        return img
+
+    def logo_canal(self, canal, alto, ancho=None, _cache={}):
+        """Logo del canal (~/videos/logos/<Canal>.png) que quepa en ancho x alto, RGBA; None si no hay.
+        Sin ancho: alto fijo. Los logos casi cuadrados quedan más altos que los alargados."""
+        ruta = os.path.join(LOGOS_DIR, canal + ".png")
+        try:
+            fecha = os.path.getmtime(ruta)
+        except OSError:
+            return None
+        clave = (ruta, alto, ancho)
+        if clave not in _cache or _cache[clave][0] != fecha:
+            try:
+                im = Image.open(ruta).convert("RGBA")
+                esc = alto / im.height if ancho is None else min(alto / im.height, ancho / im.width)
+                im = im.resize((max(1, round(im.width * esc)), max(1, round(im.height * esc))), Image.LANCZOS)
+            except OSError:
+                im = None
+            _cache[clave] = (fecha, im)
+        return _cache[clave][1]
+
+    def _emblema(self, texto, w, h, _cache={}):
+        """Recuadro con siglas para "Todo" y los canales sin logo ("TV", "DC", "FOX")."""
+        clave = (texto, w, h)
+        if clave not in _cache:
+            pal = texto.split()
+            siglas = texto.upper() if len(pal) == 1 and len(texto) <= 4 else "".join(p[0] for p in pal).upper()[:3]
+            im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(im)
+            rect_redondeado(d, (0, 0, w - 1, h - 1), min(6, h // 3), GRIS_AZUL + (60,), GRIS_AZUL + (255,))
+            f = self.f_sel if h >= 30 else self.f_mosca
+            tw, th = d.textsize(siglas, font=f)
+            d.text(((w - tw) // 2, (h - th) // 2 - 1), siglas, font=f, fill=BLANCO + (255,))
+            _cache[clave] = im
+        return _cache[clave]
+
+    def _fila_canal(self, img, d, nombre, sub, y, dist, es_todo):
+        """Sección TV: el logo completo a la izquierda (o un recuadro con siglas) y el texto a la derecha."""
+        grande = self.foco >= 0 and abs(dist) < 0.5
+        bw, bh = (64, 36) if grande else (52, 20)
+        logo = None if es_todo else self.logo_canal(nombre, bh, bw)
+        if logo is None:
+            logo = self._emblema("TV" if es_todo else nombre, bw, bh)
+        cx = 26 + (64 - logo.width) // 2
+        tx, ancho = 98, W - 16 - 98 - 10
+        if grande:
+            img.paste(logo, (cx, y + (self.ALTO_GEL - logo.height) // 2), logo)
+            d.text((tx, y + 6), recortar(d, nombre, self.f_sel, ancho), font=self.f_sel, fill=BLANCO)
+            d.text((tx + 1, y + 26), recortar(d, sub, self.f_sub, ancho), font=self.f_sub,
+                   fill=mezcla(GEL, BLANCO, 0.8))
+        else:
+            k = max(0.12, 0.85 - 0.22 * max(0.0, dist - 1)) if dist >= 0 else max(0.0, 1 + dist) * 0.6
+            tenue = logo.copy()
+            tenue.putalpha(tenue.getchannel("A").point(lambda a: int(a * min(1.0, k + 0.15))))
+            img.paste(tenue, (cx, y + 13 - logo.height // 2 + 6), tenue)
+            d.text((tx, y + 12), recortar(d, nombre, self.f_item, ancho), font=self.f_item,
+                   fill=mezcla(FONDO, GRIS_AZUL, k))
+
+    def mosca_tv(self, texto):
+        """Mosca del canal (esquina inferior derecha, todo el rato): su logo semitransparente o, si no
+        tiene, el nombre en negrita."""
+        logo = self.logo_canal(texto, 34, 72)
+        if logo and logo.width * logo.height > 1500:      # todas las moscas ocupan más o menos lo mismo
+            k = (1500 / (logo.width * logo.height)) ** 0.5
+            logo = self.logo_canal(texto, round(logo.height * k), round(logo.width * k) + 1)
+        if logo:
+            img = logo.copy()
+            img.putalpha(img.getchannel("A").point(lambda a: a * 150 // 255))
+            return img
+        medir = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        tw, th = medir.textsize(texto, font=self.f_mosca)
+        img = Image.new("RGBA", (tw + 10, th + 6), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        rect_redondeado(d, (0, 0, img.width - 1, img.height - 1), 5, (0, 0, 0, 70), None)
+        d.text((6, 4), texto, font=self.f_mosca, fill=(0, 0, 0, 110))        # sombra
+        d.text((5, 3), texto, font=self.f_mosca, fill=BLANCO + (150,))
+        return img
+
+    def proximo_tv(self, texto):
+        """Aviso de programación: 'Más adelante:' en celeste y el próximo episodio debajo (RGBA)."""
+        medir = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        texto = recortar(medir, texto, self.f_proximo, 190)
+        w1, h1 = medir.textsize("Más adelante:", font=self.f_mosca)
+        w2, h2 = medir.textsize(texto, font=self.f_proximo)
+        img = Image.new("RGBA", (max(w1, w2) + 14, h1 + h2 + 11), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        rect_redondeado(d, (0, 0, img.width - 1, img.height - 1), 6, FONDO + (200,), GEL_BORDE + (220,))
+        d.text((7, 4), "Más adelante:", font=self.f_mosca, fill=CELESTE + (255,))
+        d.text((7, 5 + h1), texto, font=self.f_proximo, fill=BLANCO + (255,))
+        return img
+
+    def _categorias(self, d):
+        # Fila de categorías: la activa más grande, blanca y subrayada en celeste
+        piezas = []
+        for i, nombre in enumerate(self.CATEGORIAS):
+            fuente = self.f_cat_act if i == self.cat else self.f_cat
+            piezas.append((nombre, fuente, d.textsize(nombre, font=fuente)[0]))
+        sep = 16
+        x = (W - (sum(p[2] for p in piezas) + sep * (len(piezas) - 1))) // 2
+        for i, (nombre, fuente, ancho) in enumerate(piezas):
+            activa = i == self.cat
+            y = 36 if activa else 40
+            d.text((x, y), nombre, font=fuente, fill=BLANCO if activa else AZUL_GRIS)
+            if activa:
+                grosor = 3 if self.foco == -1 else 2
+                d.rectangle((x, 56, x + ancho, 56 + grosor - 1), fill=CELESTE)
+            if i < len(piezas) - 1:
+                d.text((x + ancho + sep // 2 - 2, 40), "·", font=self.f_cat, fill=mezcla(FONDO, AZUL_GRIS, 0.6))
+            x += ancho + sep
+
+
+# =============================================================================================
+# Bluetooth (Ajustes → Bluetooth) con bluetoothctl: buscar, emparejar, conectar, olvidar
+# =============================================================================================
+
+
+def _limpiar_terminal(b):
+    """Quita los colores y marcas de readline que escribe bluetoothctl."""
+    t = b.decode("utf-8", "replace")
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|[\x01\x02]", "", t).strip()
+
+
+class Bluetooth:
+    """Mientras se está en Ajustes → Bluetooth hay una sesión de bluetoothctl abierta con un agente
+    (el que muestra el código para escribir en un teclado y acepta los demás pedidos). Las operaciones
+    lentas (emparejar, conectar, consultar) las hace un hilo aparte para no trabar el menú.
+    El menú solo lee: encontrados, guardados, codigo, ocupado y mensaje."""
+
+    TIPOS = (("input-keyboard", "Teclado"), ("input-gaming", "Mando"), ("input-mouse", "Mouse"),
+             ("audio-card", "Parlante"), ("audio-headset", "Audífonos"), ("audio-headphones", "Audífonos"),
+             ("phone", "Teléfono"), ("computer", "Computador"), ("video-display", "TV"),
+             ("input-tablet", "Tableta"))
+    MAC = r"([0-9A-F]{2}(?::[0-9A-F]{2}){5})"
+
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.encontrados = {}          # mac -> {"nombre", "tipo", "rssi", "emparejado"}
+        self.guardados = []            # [{"mac", "nombre", "tipo", "conectado"}]
+        self.buscando = False
+        self.codigo = None             # código a escribir en el dispositivo (se muestra grande)
+        self.ocupado = None            # "Emparejando…", "Conectando…"...
+        self.mensaje = None            # (texto, hasta)
+        self.visible_hasta = 0         # Música → Conectar un teléfono: la TV visible como "Mini TV"
+        self.eventos = queue.Queue()
+        self.trabajos = queue.Queue()
+        threading.Thread(target=self._trabajador, daemon=True).start()
+
+    # ----- sesión interactiva (agente + búsqueda) -----
+    def _abrir(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        self.proc = subprocess.Popen(["bluetoothctl"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, bufsize=0)
+        threading.Thread(target=self._leer, args=(self.proc,), daemon=True).start()
+        self._orden("agent KeyboardDisplay")
+        self._orden("default-agent")
+
+    def _orden(self, texto):
+        try:
+            self.proc.stdin.write((texto + "\n").encode())
+            self.proc.stdin.flush()
+        except (OSError, AttributeError, ValueError):
+            pass
+
+    def cerrar_sesion(self):
+        self.dejar_de_buscar()
+        if self.proc and self.proc.poll() is None:
+            self._orden("quit")
+            try:
+                self.proc.wait(2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+
+    def _leer(self, proc):
+        resto = b""
+        fd = proc.stdout.fileno()
+        while True:
+            try:
+                trozo = os.read(fd, 4096)
+            except OSError:
+                break
+            if not trozo:
+                break
+            partes = re.split(rb"[\r\n]", resto + trozo)
+            resto = partes.pop()
+            for p in partes:
+                self._linea(_limpiar_terminal(p))
+            pendiente = _limpiar_terminal(resto)        # las preguntas del agente no terminan en \n
+            if re.search(r"\(yes/no\)|Enter PIN code|Enter passkey", pendiente):
+                self._linea(pendiente)
+                resto = b""
+
+    def _linea(self, l):
+        if not l:
+            return
+        m = re.search(r"\[NEW\] Device " + self.MAC + r" (.*)", l)
+        if m:
+            self._visto(m.group(1), m.group(2))
+            return
+        m = re.search(r"\[CHG\] Device " + self.MAC + r" (Name|Alias|RSSI): (.*)", l)
+        if m:
+            mac, campo, valor = m.groups()
+            if campo == "RSSI":
+                with self.lock:
+                    if mac in self.encontrados:
+                        n = re.search(r"\((-?\d+)\)|^(-?\d+)$", valor.strip())   # "-64" o "0xffffffc0 (-64)"
+                        if n:
+                            self.encontrados[mac]["rssi"] = int(n.group(1) or n.group(2))
+            else:
+                self._visto(mac, valor)
+            return
+        m = re.search(r"Passkey: (\d+)", l) or re.search(r"PIN code: (\w+)", l)
+        if m and "Enter" not in l:
+            self.codigo = m.group(1).zfill(6) if m.group(1).isdigit() and "Passkey" in l else m.group(1)
+            log(f"Bluetooth: código {self.codigo}")
+            return
+        m = re.search(r"Confirm passkey (\d+)", l)
+        if m:                                           # teléfono: el mismo código sale en su pantalla
+            self.codigo = m.group(1).zfill(6)
+            self._orden("yes")
+            return
+        if re.search(r"Authorize service|Request authorization|Accept pairing", l):
+            self._orden("yes")                          # mandos y parlantes: aceptar
+            return
+        m = re.search(r"\[CHG\] Device " + self.MAC + r" Paired: yes", l)
+        if m and self.visible():                        # un teléfono se emparejó: de confianza (se reconecta solo)
+            self._orden(f"trust {m.group(1)}")
+            self.codigo = None
+            self._avisar("Teléfono emparejado", "Ya puedes poner música en él")
+            return
+        if "Enter PIN code" in l:
+            self._orden("0000")                         # dispositivos antiguos con PIN fijo
+            return
+        if "Enter passkey" in l:
+            self._orden("0")
+            return
+        for frase in ("Pairing successful", "AlreadyExists", "Failed to pair", "Connection successful",
+                      "Failed to connect", "not available"):
+            if frase in l:                              # solo la primera ("Failed to pair: ...AlreadyExists")
+                self.eventos.put(frase)
+                break
+
+    def _visto(self, mac, nombre):
+        con_nombre = nombre and not re.fullmatch(r"[0-9A-F]{2}(?:-[0-9A-F]{2}){5}", nombre)
+        nuevo = False
+        with self.lock:
+            if not self.buscando:
+                return
+            d = self.encontrados.get(mac)
+            if d is None:
+                d = self.encontrados[mac] = {"nombre": None, "tipo": None, "rssi": -999, "emparejado": False,
+                                             "consultado": False}
+            if con_nombre:
+                d["nombre"] = nombre
+                if not d["consultado"]:
+                    d["consultado"] = nuevo = True
+        if nuevo:
+            self.trabajos.put(lambda: self._completar(mac))
+
+    def _completar(self, mac):
+        info = self.info(mac)
+        with self.lock:
+            d = self.encontrados.get(mac)
+            if d:
+                d["tipo"] = info["tipo"]
+                d["emparejado"] = info["emparejado"]
+                d["nombre"] = info["nombre"] or d["nombre"]
+
+    # ----- consultas sueltas -----
+    @classmethod
+    def tipo_de(cls, icono):
+        return next((t for i, t in cls.TIPOS if icono.startswith(i)), "Dispositivo")
+
+    def info(self, mac):
+        try:
+            out = subprocess.run(["bluetoothctl", "info", mac], capture_output=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            out = b""
+        campos = dict(re.findall(r"^\s*(\w+): (.*)$", _limpiar_terminal(out), re.M))
+        return {"mac": mac, "nombre": campos.get("Alias") or campos.get("Name"),
+                "tipo": self.tipo_de(campos.get("Icon", "")), "emparejado": campos.get("Paired") == "yes",
+                "conectado": campos.get("Connected") == "yes"}
+
+    def _ejecutar(self, *args, espera=25):
+        try:
+            r = subprocess.run(["bluetoothctl", *args], capture_output=True, timeout=espera)
+            return _limpiar_terminal(r.stdout)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    # ----- lo que pide el menú -----
+    def buscar(self):
+        with self.lock:
+            self.encontrados, self.buscando = {}, True
+        self._abrir()
+        self._orden("scan on")
+        log("Bluetooth: buscando")
+
+    def hacer_visible(self, segundos=180):
+        """Para emparejar un teléfono: la TV aparece como "Mini TV" en su lista de Bluetooth."""
+        self._abrir()
+        self._orden("pairable on")
+        self._orden(f"discoverable-timeout {segundos}")
+        self._orden("discoverable on")
+        self.visible_hasta = ahora() + segundos
+        self.codigo = None
+        log(f"Bluetooth: visible {segundos} s para emparejar un teléfono")
+
+    def visible(self):
+        return self.visible_hasta > ahora()
+
+    def revisar(self, en_menu_bluetooth):
+        """Al acabar el tiempo visible: dejar de ser visible y cerrar la sesión si no se usa."""
+        if self.visible_hasta and not self.visible():
+            self.visible_hasta = 0
+            self.codigo = None
+            self._orden("discoverable off")
+            if not en_menu_bluetooth:
+                self.cerrar_sesion()
+
+    def dejar_de_buscar(self):
+        if self.buscando:
+            self.buscando = False
+            self._orden("scan off")
+
+    def lista_encontrados(self):
+        """Dispositivos con nombre y aún no emparejados; primero los de tipo conocido, luego por señal."""
+        with self.lock:
+            ds = [dict(d, mac=m) for m, d in self.encontrados.items() if d["nombre"] and not d["emparejado"]]
+        return sorted(ds, key=lambda d: (d["tipo"] in (None, "Dispositivo"), -d["rssi"]))
+
+    def actualizar_guardados(self):
+        def tarea():
+            out = self._ejecutar("paired-devices", espera=5)
+            macs = re.findall(r"Device " + self.MAC, out)
+            self.guardados = [self.info(m) for m in macs]
+        self.trabajos.put(tarea)
+
+    def _avisar(self, texto, detalle=None, segundos=3):
+        self.mensaje = (texto, ahora() + segundos, detalle)
+        log(f"Bluetooth: {texto}" + (f" ({detalle})" if detalle else ""))
+
+    def emparejar(self, mac, nombre):
+        def tarea():
+            self.dejar_de_buscar()
+            self._abrir()
+            while not self.eventos.empty():
+                self.eventos.get_nowait()
+            self.codigo, self.ocupado = None, f"Emparejando con {nombre}…"
+            self._orden(f"pair {mac}")
+            r = self._esperar(("Pairing successful", "AlreadyExists", "Failed to pair", "not available"), 60)
+            self.codigo = None
+            if r not in ("Pairing successful", "AlreadyExists"):
+                self.ocupado = None
+                self._avisar("No se pudo conectar")
+                return
+            self.ocupado = f"Conectando con {nombre}…"
+            self._orden(f"trust {mac}")
+            time.sleep(0.5)
+            self._orden(f"connect {mac}")
+            self._esperar(("Connection successful", "Failed to connect"), 20)
+            ok = self.info(mac)["conectado"]
+            self.ocupado = None
+            if ok and "Joy-Con" in (nombre or ""):
+                # joycond los deja parpadeando hasta elegir cómo se usan
+                self._avisar("Conectado", "Dos juntos: pulsa L + R a la vez. Uno de lado: SL + SR", 8)
+            else:
+                self._avisar("Conectado" if ok else "No se pudo conectar")
+            with self.lock:
+                self.encontrados.pop(mac, None)
+            self.actualizar_guardados()
+        self.trabajos.put(tarea)
+
+    def _esperar(self, frases, segundos):
+        limite = ahora() + segundos
+        while ahora() < limite:
+            try:
+                e = self.eventos.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if e in frases:
+                return e
+        return None
+
+    def accion(self, mac, nombre, que):
+        """que: 'conectar', 'desconectar' u 'olvidar'."""
+        def tarea():
+            if que == "conectar":
+                self.ocupado = f"Conectando con {nombre}…"
+                self._ejecutar("connect", mac)
+                self._avisar("Conectado" if self.info(mac)["conectado"] else "No se pudo conectar")
+            elif que == "desconectar":
+                self.ocupado = f"Desconectando {nombre}…"
+                self._ejecutar("disconnect", mac)
+                self._avisar("Desconectado")
+            else:
+                self.ocupado = f"Olvidando {nombre}…"
+                self._ejecutar("remove", mac)
+                self._avisar("Olvidado")
+            self.ocupado = None
+            self.actualizar_guardados()
+        self.trabajos.put(tarea)
+
+    def _trabajador(self):
+        while True:
+            tarea = self.trabajos.get()
+            try:
+                tarea()
+            except Exception as e:                      # que un fallo no deje el menú "ocupado"
+                log(f"Bluetooth: error {e!r}")
+                self.ocupado, self.codigo = None, None
+                self._avisar("No se pudo conectar")
+
+
+# =============================================================================================
+# Botones físicos (a GND, con el pull-up interno): se leen en un hilo cada 5 ms
+# =============================================================================================
+
+
+# =============================================================================================
+# Música: Spotify Connect (raspotify / librespot, la TV aparece como "Mini TV" en la app)
+# =============================================================================================
+
+
+class Spotify:
+    """Lee lo que deja minitv-spotify-evento (lo ejecuta librespot) en /run/raspotify:
+    pista.txt (canción), reproduccion.txt (loading/playing/paused/stopped + posición) y volumen.txt.
+    La carátula se descarga en un hilo aparte. No guarda nada de la cuenta."""
+
+    TAM_CARATULA = 112
+
+    def __init__(self):
+        self.fechas = {}
+        self.pista = {}
+        self.estado, self.pos_ms, self.at_ms = None, 0, 0
+        self.volumen = None
+        self.caratula = None            # (track_id, Image RGB TAM x TAM)
+        self.bajando = None
+
+    @staticmethod
+    def _leer(nombre):
+        try:
+            with open(os.path.join(SPOTIFY_DIR, nombre), encoding="utf-8", errors="replace") as f:
+                return dict(l.rstrip("\n").split("\t", 1) for l in f if "\t" in l)
+        except OSError:
+            return None
+
+    def _cambio(self, nombre):
+        try:
+            fecha = os.path.getmtime(os.path.join(SPOTIFY_DIR, nombre))
+        except OSError:
+            fecha = None
+        if fecha != self.fechas.get(nombre):
+            self.fechas[nombre] = fecha
+            return True
+        return False
+
+    def poll(self):
+        """Devuelve el conjunto de cosas que cambiaron: 'pista', 'estado', 'volumen'."""
+        cambios = set()
+        if self._cambio("pista.txt"):
+            self.pista = self._leer("pista.txt") or {}
+            cambios.add("pista")
+            self._pedir_caratula()
+        if self._cambio("reproduccion.txt"):
+            r = self._leer("reproduccion.txt")
+            if r is None:                                   # raspotify se reinició: no hay sesión
+                self.estado, self.pos_ms = None, 0
+            else:
+                self.estado = r.get("STATE")
+                self.pos_ms = int(r.get("POSITION_MS", "0") or 0)
+                self.at_ms = int(r.get("AT_MS", "0") or 0)
+            cambios.add("estado")
+        if self._cambio("volumen.txt"):
+            v = self._leer("volumen.txt")
+            if v and v.get("VOLUME", "").isdigit():
+                self.volumen = int(v["VOLUME"])
+                cambios.add("volumen")
+        return cambios
+
+    origen = "Spotify · Mini TV"
+
+    def activo(self):
+        return self.estado in ("loading", "playing", "paused")
+
+    def sonando(self):
+        return self.estado in ("loading", "playing")
+
+    @property
+    def nombre(self):
+        return self.pista.get("NAME", "")
+
+    @property
+    def artistas(self):
+        return ", ".join(a for a in self.pista.get("ARTISTS", "").split("|") if a)
+
+    @property
+    def album(self):
+        return self.pista.get("ALBUM", "")
+
+    @property
+    def duracion_ms(self):
+        d = self.pista.get("DURATION_MS", "0")
+        return int(d) if d.isdigit() else 0
+
+    def posicion_ms(self):
+        p = self.pos_ms
+        if self.estado == "playing" and self.at_ms:
+            p += max(0, int(time.time() * 1000) - self.at_ms)
+        return min(p, self.duracion_ms) if self.duracion_ms else p
+
+    def _pedir_caratula(self):
+        tid = self.pista.get("TRACK_ID")
+        urls = [u for u in self.pista.get("COVERS", "").split("|") if u.startswith("http")]
+        if not urls or (self.caratula and self.caratula[0] == tid) or self.bajando == tid:
+            return
+        url = urls[1] if len(urls) >= 3 else urls[0]          # la mediana (~300 px) si hay varias
+        self.bajando = tid
+
+        def bajar():
+            try:
+                import io
+                import urllib.request
+                with urllib.request.urlopen(url, timeout=8) as r:
+                    img = Image.open(io.BytesIO(r.read())).convert("RGB")
+                img = img.resize((self.TAM_CARATULA, self.TAM_CARATULA), Image.LANCZOS)
+                self.caratula = (tid, img)
+            except Exception as e:
+                log(f"Spotify: no se pudo bajar la carátula ({e!r})")
+            finally:
+                self.bajando = None
+        threading.Thread(target=bajar, daemon=True).start()
+
+    def imagen_caratula(self):
+        if self.caratula and self.caratula[0] == self.pista.get("TRACK_ID"):
+            return self.caratula[1]
+        return None
+
+    def cortar(self):
+        """Corta la música (la sesión de Spotify termina) y libera el audio para la TV."""
+        log("Spotify: cortar la música")
+        subprocess.run(["sudo", "-n", "systemctl", "restart", "raspotify"], timeout=15)
+        self.estado, self.pos_ms = None, 0
+
+
+class TelefonoBT:
+    """Un teléfono conectado por Bluetooth que manda música a la TV ("Mini TV", parlante A2DP con
+    bluez-alsa). Un hilo consulta a BlueZ por D-Bus cada segundo: transporte de audio (si suena y su
+    volumen) y el reproductor AVRCP (canción, artista, álbum, duración, posición). Misma interfaz que
+    Spotify para la pantalla "Ahora suena". El audio lo reproduce bluealsa-aplay, que solo se arranca
+    después de detener VLC (la tarjeta de sonido no se comparte)."""
+
+    def __init__(self):
+        self.estado = None              # "playing", "paused" o None (sin teléfono sonando)
+        self.pista = {}
+        self.pos_ms, self.at_ms = 0, 0
+        self.volumen = None             # 0..65535 (como Spotify), desde el volumen del teléfono
+        self.dispositivo = ""
+        self.jugador = None             # ruta D-Bus del reproductor AVRCP (para pausar)
+        self.aplay = None
+        self._ultimo = None
+        self._bloqueo = threading.Lock()
+        threading.Thread(target=self._vigilar, daemon=True).start()
+
+    def _vigilar(self):
+        bus = None
+        while True:
+            try:
+                import dbus
+                if bus is None:
+                    bus = dbus.SystemBus()
+                om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+                objs = om.GetManagedObjects()
+                # Un teléfono emparejado que manda audio y no es "de confianza": BlueZ le niega el
+                # canal de audio (a2dp auth_cb: Access denied). Marcarlo de confianza aquí mismo.
+                for ruta, ifs in objs.items():
+                    dev = ifs.get("org.bluez.Device1")
+                    if dev and dev.get("Paired") and not dev.get("Trusted") and \
+                            "0000110a-0000-1000-8000-00805f9b34fb" in [str(u) for u in dev.get("UUIDs", [])]:
+                        dbus.Interface(bus.get_object("org.bluez", ruta), "org.freedesktop.DBus.Properties") \
+                            .Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+                        log(f"Teléfono BT: {dev.get('Alias', ruta)} marcado de confianza")
+                transportes = [(str(p), i["org.bluez.MediaTransport1"]) for p, i in objs.items()
+                               if "org.bluez.MediaTransport1" in i]
+                jugadores = [(str(p), i["org.bluez.MediaPlayer1"]) for p, i in objs.items()
+                             if "org.bluez.MediaPlayer1" in i]
+                estado, pista, pos, vol, disp, jugador = None, {}, 0, None, "", None
+                if transportes:
+                    ruta_t, t = transportes[0]
+                    if "Volume" in t:
+                        vol = int(int(t["Volume"]) * 65535 / 127)
+                    dev = str(t.get("Device", ""))
+                    disp = str(objs.get(dev, {}).get("org.bluez.Device1", {}).get("Alias", ""))
+                    jug = next(((p, j) for p, j in jugadores if p.startswith(dev)), None)
+                    status = str(jug[1].get("Status", "")) if jug else ""
+                    if jug:
+                        jugador = jug[0]
+                        tr = jug[1].get("Track", {})
+                        pista = {"NAME": str(tr.get("Title", "")), "ARTISTS": str(tr.get("Artist", "")),
+                                 "ALBUM": str(tr.get("Album", "")), "DURATION_MS": str(int(tr.get("Duration", 0)))}
+                        pos = int(jug[1].get("Position", 0))
+                    if status == "playing" or str(t.get("State", "")) in ("active", "pending"):
+                        estado = "playing"
+                    elif status == "paused":
+                        estado = "paused"
+                with self._bloqueo:
+                    if pos != self.pos_ms or estado != self.estado:
+                        self.pos_ms, self.at_ms = pos, int(time.time() * 1000)
+                    self.estado, self.pista, self.volumen = estado, pista, vol
+                    self.dispositivo, self.jugador = disp, jugador
+            except Exception as e:
+                if bus is not None:
+                    log(f"Teléfono BT: {e!r}")
+                bus = None
+                time.sleep(2)
+            time.sleep(1)
+
+    def poll(self):
+        with self._bloqueo:
+            ahora_ = (self.estado, self.pista.get("NAME"), self.volumen)
+        antes, self._ultimo = self._ultimo, ahora_
+        cambios = set()
+        if antes is None or antes[0] != ahora_[0]:
+            cambios.add("estado")
+        if antes is None or antes[1] != ahora_[1]:
+            cambios.add("pista")
+        if ahora_[2] is not None and (antes is None or antes[2] != ahora_[2]):
+            cambios.add("volumen")
+        return cambios
+
+    def activo(self):
+        # En pausa solo cuenta mientras la TV está reproduciendo su audio (si no, una pausa en el
+        # teléfono bloquearía la TV para siempre)
+        sonando_aqui = self.aplay is not None and self.aplay.poll() is None
+        return self.estado == "playing" or (self.estado == "paused" and sonando_aqui)
+
+    def sonando(self):
+        return self.estado == "playing"
+
+    origen = property(lambda self: f"Bluetooth · {self.dispositivo or 'teléfono'}")
+    nombre = property(lambda self: self.pista.get("NAME", "") or "Música por Bluetooth")
+    artistas = property(lambda self: self.pista.get("ARTISTS", ""))
+    album = property(lambda self: self.pista.get("ALBUM", ""))
+
+    @property
+    def duracion_ms(self):
+        d = self.pista.get("DURATION_MS", "0")
+        return int(d) if d.isdigit() else 0
+
+    def posicion_ms(self):
+        p = self.pos_ms
+        if self.estado == "playing" and self.at_ms:
+            p += max(0, int(time.time() * 1000) - self.at_ms)
+        return min(p, self.duracion_ms) if self.duracion_ms else p
+
+    def imagen_caratula(self):
+        return None                     # AVRCP de BlueZ 5.55 no trae la carátula
+
+    def iniciar_audio(self):
+        if self.aplay is None or self.aplay.poll() is not None:
+            self.aplay = subprocess.Popen(["bluealsa-aplay", "-S", f"--pcm={BT_AUDIO}"],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log("Teléfono BT: audio a la TV")
+
+    def detener_audio(self):
+        if self.aplay and self.aplay.poll() is None:
+            self.aplay.terminate()
+            try:
+                self.aplay.wait(2)
+            except subprocess.TimeoutExpired:
+                self.aplay.kill()
+        self.aplay = None
+
+    def cortar(self):
+        """Pausar el teléfono y liberar el audio para la TV."""
+        try:
+            import dbus
+            if self.jugador:
+                dbus.Interface(dbus.SystemBus().get_object("org.bluez", self.jugador),
+                               "org.bluez.MediaPlayer1").Pause()
+        except Exception as e:
+            log(f"Teléfono BT: no se pudo pausar ({e!r})")
+        self.detener_audio()
+        with self._bloqueo:
+            self.estado = "paused" if self.estado else None
+
+
+class LectorMandos(threading.Thread):
+    """Mandos (Joy-Con, Mando Pro, cualquier gamepad) y teclados por evdev, para manejar el menú.
+    Convierte en las mismas órdenes que los botones: arriba/abajo (cruceta, stick o flechas),
+    elegir (A, +, −, Enter) y menu = volver (B, Home, Captura, Esc, Retroceso).
+    Detecta los que se conectan o desconectan (Bluetooth) cada 2 s. Mientras hay un juego abierto
+    no hace nada: los controles son de RetroArch."""
+
+    REPETIR_TRAS, REPETIR_CADA = 0.45, 0.13      # mantener una dirección: repetir
+
+    def __init__(self, cola, activo):
+        super().__init__(daemon=True)
+        import evdev
+        self.evdev, self.cola, self.activo = evdev, cola, activo
+        e = evdev.ecodes
+        # Un Joy-Con suelto tiene pocos botones: que todos hagan algo (gatillos y SL/SR también mueven)
+        self.ELEGIR = {e.BTN_EAST, e.BTN_NORTH, e.BTN_START, e.BTN_SELECT, e.BTN_THUMBL, e.BTN_THUMBR,
+                       e.KEY_ENTER, e.KEY_KPENTER}
+        self.VOLVER = {e.BTN_SOUTH, e.BTN_WEST, e.BTN_MODE, e.BTN_Z, e.KEY_ESC, e.KEY_BACKSPACE}
+        self.ARRIBA = {e.BTN_DPAD_UP, e.BTN_DPAD_LEFT, e.BTN_TL, e.BTN_TL2, e.KEY_UP, e.KEY_LEFT}
+        self.ABAJO = {e.BTN_DPAD_DOWN, e.BTN_DPAD_RIGHT, e.BTN_TR, e.BTN_TR2, e.KEY_DOWN, e.KEY_RIGHT}
+        self.disp = {}          # fd -> InputDevice
+        self.ejes = {}          # (fd, código) -> (centro, umbral)
+        self.valores = {}       # (fd, código) -> último valor del eje (para elegir el eje dominante)
+        self.direccion = {}     # (fd, origen) -> "arriba"/"abajo"/None (origen: hat o stick)
+        self.mantenida = None   # (orden, desde, última repetición)
+        self.t_buscar = 0
+
+    def _sirve(self, d):
+        if "IMU" in d.name:                      # sensores de movimiento de los Joy-Con
+            return False
+        caps = d.capabilities()
+        teclas = set(caps.get(self.evdev.ecodes.EV_KEY, []))
+        e = self.evdev.ecodes
+        return bool(teclas & {e.BTN_SOUTH, e.BTN_EAST, e.BTN_DPAD_UP, e.BTN_START}) or \
+            {e.KEY_ENTER, e.KEY_UP} <= teclas
+
+    def _buscar(self):
+        rutas = {d.path for d in self.disp.values()}
+        for ruta in self.evdev.list_devices():
+            if ruta in rutas:
+                continue
+            try:
+                d = self.evdev.InputDevice(ruta)
+            except OSError:
+                continue
+            if not self._sirve(d):
+                d.close()
+                continue
+            self.disp[d.fd] = d
+            for codigo, info in d.capabilities(absinfo=True).get(self.evdev.ecodes.EV_ABS, []):
+                centro = (info.max + info.min) / 2
+                self.ejes[(d.fd, codigo)] = (centro, (info.max - info.min) / 4)
+            log(f"Mando/teclado para el menú: {d.name}")
+
+    def _quitar(self, fd):
+        d = self.disp.pop(fd, None)
+        if d:
+            log(f"Desconectado: {d.name}")
+            try:
+                d.close()
+            except OSError:
+                pass
+
+    def _orden(self, orden, origen):
+        self.cola.put((orden, origen))
+
+    def _direccion(self, fd, origen, nueva, nombre):
+        clave = (fd, origen)
+        if self.direccion.get(clave) == nueva:
+            return
+        self.direccion[clave] = nueva
+        if nueva:
+            self._orden(nueva, nombre)
+            self.mantenida = (nueva, ahora(), ahora(), nombre)
+        elif self.mantenida and self.mantenida[0]:
+            self.mantenida = None
+
+    def _evento(self, d, ev):
+        e = self.evdev.ecodes
+        if ev.type == e.EV_KEY:
+            if ev.value == 1:                    # pulsar (2 = repetición del teclado: ignorar)
+                if ev.code in self.ELEGIR:
+                    self._orden("elegir", d.name)
+                elif ev.code in self.VOLVER:
+                    self._orden("menu", d.name)
+                elif ev.code in self.ARRIBA or ev.code in self.ABAJO:
+                    orden = "arriba" if ev.code in self.ARRIBA else "abajo"
+                    self._orden(orden, d.name)
+                    self.mantenida = (orden, ahora(), ahora(), d.name)
+            elif ev.value == 0 and (ev.code in self.ARRIBA or ev.code in self.ABAJO):
+                self.mantenida = None
+        elif ev.type == e.EV_ABS:
+            if ev.code in (e.ABS_HAT0X, e.ABS_HAT0Y):
+                nueva = "arriba" if ev.value < 0 else "abajo" if ev.value > 0 else None
+                self._direccion(d.fd, f"hat{ev.code}", nueva, d.name)
+            elif ev.code in (e.ABS_X, e.ABS_Y, e.ABS_RX, e.ABS_RY):   # cualquier stick (el Joy-Con derecho solo tiene RX/RY)
+                # Con el Joy-Con de lado los dos ejes se mueven a la vez: cuenta solo el que más se movió
+                par = (e.ABS_X, e.ABS_Y) if ev.code in (e.ABS_X, e.ABS_Y) else (e.ABS_RX, e.ABS_RY)
+                self.valores[(d.fd, ev.code)] = ev.value
+                mejor, nueva = 0.0, None
+                for codigo in par:
+                    centro, umbral = self.ejes.get((d.fd, codigo), (0, 1 << 30))
+                    v = self.valores.get((d.fd, codigo), centro) - centro
+                    if abs(v) > umbral and abs(v) / umbral > mejor:
+                        mejor, nueva = abs(v) / umbral, ("arriba" if v < 0 else "abajo")
+                self._direccion(d.fd, f"stick{par[0]}", nueva, d.name)
+
+    def run(self):
+        import select
+        while True:
+            t = ahora()
+            if t - self.t_buscar > 2:
+                self.t_buscar = t
+                try:
+                    self._buscar()
+                except Exception as ex:          # nunca dejar el menú sin botones por un mando raro
+                    log(f"Mandos: {ex!r}")
+            try:
+                listos, _, _ = select.select(list(self.disp), [], [], 0.05)
+            except (OSError, ValueError):
+                listos = []
+                for fd in list(self.disp):
+                    try:
+                        os.fstat(fd)
+                    except OSError:
+                        self._quitar(fd)
+            for fd in listos:
+                d = self.disp.get(fd)
+                try:
+                    eventos = list(d.read())
+                except OSError:
+                    self._quitar(fd)
+                    continue
+                if self.activo():
+                    for ev in eventos:
+                        self._evento(d, ev)
+            if self.mantenida and self.activo():
+                orden, desde, ultima, nombre = self.mantenida
+                if ahora() - desde > self.REPETIR_TRAS and ahora() - ultima > self.REPETIR_CADA:
+                    self._orden(orden, nombre)
+                    self.mantenida = (orden, desde, ahora(), nombre)
+            elif not self.activo():
+                self.mantenida = None
+
+
+class LectorBotones(threading.Thread):
+    """Convierte pulsaciones en órdenes (las mismas que minitv-control) y las deja en una cola.
+    Corta = al soltar antes del tiempo de 'mantenido'. Mantenido = en cuanto se cumple el tiempo
+    (sin esperar a soltar); el soltar posterior se ignora. Antirrebote: 8 lecturas iguales (40 ms)."""
+
+    PERIODO = 0.005
+    ESTABLE = 8
+
+    def __init__(self, botones, cola):
+        """botones: lista de (gpio, orden_corta, orden_mantenida, segundos_mantenido)."""
+        super().__init__(daemon=True)
+        import RPi.GPIO as GPIO
+        self.GPIO = GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        self.botones = []
+        for gpio, corta, mantenida, t_mantenido in botones:
+            GPIO.setup(gpio, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            self.botones.append({"gpio": gpio, "corta": corta, "mantenida": mantenida, "t": t_mantenido,
+                                 "pulsado": False, "desde": 0.0, "mantenida_enviada": False, "iguales": 0})
+        self.cola = cola
+
+    def run(self):
+        while True:
+            t = ahora()
+            for b in self.botones:
+                abajo = self.GPIO.input(b["gpio"]) == 0
+                if abajo != b["pulsado"]:
+                    b["iguales"] += 1
+                    if b["iguales"] >= self.ESTABLE:          # cambio confirmado (antirrebote)
+                        b["iguales"] = 0
+                        b["pulsado"] = abajo
+                        if abajo:
+                            b["desde"], b["mantenida_enviada"] = t, False
+                        elif not b["mantenida_enviada"]:
+                            self.cola.put((b["corta"], f"botón GPIO{b['gpio']} corto"))
+                else:
+                    b["iguales"] = 0
+                    if abajo and not b["mantenida_enviada"] and t - b["desde"] >= b["t"]:
+                        b["mantenida_enviada"] = True
+                        self.cola.put((b["mantenida"], f"botón GPIO{b['gpio']} mantenido {b['t']:g} s"))
+            time.sleep(self.PERIODO)
+
+
+# =============================================================================================
+# Programa principal
+# =============================================================================================
+
+
+class TV:
+    def __init__(self):
+        self.salir = False
+        signal.signal(signal.SIGTERM, self._terminar)
+        signal.signal(signal.SIGINT, self._terminar)
+        self.estado = Estado()
+        self.series = buscar_series()
+        self.consolas = buscar_consolas()
+        self.partida = None                        # juego en curso (RetroArch)
+        self.aviso = None                          # (texto, hasta): aviso temporal abajo del menú
+        self.bt = Bluetooth()                      # Ajustes → Bluetooth
+        self.spotify = Spotify()                   # Música: Spotify Connect
+        self.telefono = TelefonoBT()               # Música: el teléfono por Bluetooth ("Mini TV")
+        self.fuente = None                         # fuente de la música en pantalla
+        self.tras_musica = None                    # qué retomar al volver de la música ("TV" o una Serie)
+        self.fb = Framebuffer()
+        self.fb.negro()
+        self.estatica = Estatica()                 # tubo de encendido -> estática
+        self.menu = Menu(self)
+        if self.estado.datos.get("ultimo_modo") == "tv":
+            self.menu.seleccionar_tv()
+        else:
+            self.menu.seleccionar_serie(self.estado.datos.get("ultima"))
+        self.control = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            os.unlink(SOCK_CONTROL)
+        except OSError:
+            pass
+        self.control.bind(SOCK_CONTROL)
+        os.chmod(SOCK_CONTROL, 0o660)
+        self.control.setblocking(False)
+        self.cola_botones = queue.Queue()
+        botones = []
+        if BOTON1_GPIO is not None:
+            botones.append((BOTON1_GPIO, "menu", "apagar", 2.0))
+        if BOTON2_GPIO is not None:
+            botones.append((BOTON2_GPIO, "abajo", "elegir", 0.8))
+        if botones:
+            LectorBotones(botones, self.cola_botones).start()
+            log("Botones activos: " + ", ".join(f"GPIO{g}" for g, *_ in botones))
+        try:                                       # mandos (Joy-Con, Mando Pro...) y teclados en el menú
+            LectorMandos(self.cola_botones, lambda: self.modo != "juego").start()
+        except ImportError:
+            log("Sin python3-evdev: el menú solo responde a los botones")
+        self.repro = None
+        self.p_apagado = None                      # reposo: minitv-estatica apagado (pantalla negra)
+        self._remoto_previo = None                 # último estado escrito en remoto.json
+        self.vlc_aux = None                        # VLC de "SIN SEÑAL"
+        self.modo = "menu"
+        # tubo (0,55 s) + logo (2 s) + un poco de estática "sintonizando" antes del menú
+        self.t_ocultar_estatica = ahora() + (3.4 if os.path.exists(LOGO_ARRANQUE) else 1.6)
+        self.t_input = self.t_ocultar_estatica
+        self.t_cuadro = 0
+        self.t_aux = 0
+        log(f"Inicio: {len(self.series)} series en {VIDEO_DIR}")
+
+    def _terminar(self, *_):
+        self.salir = True
+
+    # ----- órdenes -----
+    def ordenes(self):
+        """Órdenes pendientes: de los botones físicos y del socket de minitv-control."""
+        out = []
+        while True:
+            try:
+                orden, origen = self.cola_botones.get_nowait()
+                log(f"{origen} -> {orden}")
+                out.append(orden)
+            except queue.Empty:
+                break
+        while True:
+            try:
+                out.append(self.control.recv(64).decode("utf-8", "replace").strip().lower())
+            except BlockingIOError:
+                return out
+
+    REMOTAS = {"sube", "baja", "izquierda", "derecha", "ok", "atras", "inicio", "pausa", "stop",
+               "vol+", "vol-", "encendido"}
+
+    def traducir(self, ords):
+        """Órdenes del control remoto -> órdenes según lo que se está viendo (las demás pasan igual)."""
+        out = []
+        for o in ords:
+            if o not in self.REMOTAS:
+                out.append(o)
+                continue
+            if o == "encendido":
+                out.append("despertar" if self.modo == "reposo" else "reposo")
+                continue
+            if self.modo == "menu":
+                if o == "izquierda" and self.menu.dentro():
+                    o = "menu"
+                else:
+                    o = {"sube": "arriba", "baja": "abajo", "ok": "elegir", "atras": "menu",
+                         "izquierda": "lado-", "derecha": "lado+", "inicio": "inicio",
+                         "vol+": "vol+", "vol-": "vol-"}.get(o)
+            elif self.modo == "tv":
+                o = {"sube": "canal+", "baja": "canal-", "ok": "info", "atras": "menu", "inicio": "menu",
+                     "stop": "menu", "pausa": "pausa", "vol+": "girar+", "vol-": "girar-"}.get(o)
+            elif self.modo == "juego":
+                o = {"atras": "menu", "inicio": "menu", "stop": "menu", "vol+": "girar+", "vol-": "girar-"}.get(o)
+            elif self.modo == "musica":
+                o = {"atras": "menu", "inicio": "menu", "stop": "menu"}.get(o)
+            elif self.modo == "sin_senal":
+                o = "menu"
+            else:
+                o = None
+            if o:
+                out.append(o)
+        return out
+
+    def cambiar_canal(self, d):
+        """▲ ▼ del control durante un episodio: canal siguiente / anterior (en TV: Todo y los canales
+        de canales.txt; viendo una serie: la serie siguiente / anterior)."""
+        if isinstance(self.repro, CanalTV):
+            lista = [None] + [n for n, _ in leer_canales(self.series)]
+            i = lista.index(self.repro.canal) if self.repro.canal in lista else 0
+            self.repro.parar()
+            self.repro = None
+            self.estatica.mostrar()
+            self.ver_tv(lista[(i + d) % len(lista)])
+        elif self.repro:
+            lista = [s for s in self.series if s.episodios]
+            i = next((k for k, s in enumerate(lista) if s.id == self.repro.serie.id), 0)
+            self.repro.parar()
+            self.repro = None
+            self.estatica.mostrar()
+            if lista:
+                self.ver(lista[(i + d) % len(lista)])
+
+    def reposo(self):
+        """Botón rojo del control: la TV se "apaga" con la animación de tubo y queda en negro, sin
+        apagar la Pi (así el control la puede volver a encender)."""
+        log("Reposo (desde el control remoto)")
+        if self.repro:
+            self.repro.parar()
+            self.repro = None
+        if self.partida:
+            self.partida.parar()                   # que RetroArch guarde la partida antes
+            self.partida = None
+        if self.modo == "musica":
+            self.salir_musica(cortar=True)
+            if self.repro:
+                self.repro.parar()
+                self.repro = None
+        self.cerrar_aux()
+        self.menu.remoto_pantalla = False
+        self.estado.guardar()
+        self.p_apagado = subprocess.Popen([ESTATICA, "apagado"])
+        self.modo = "reposo"
+
+    def despertar(self):
+        log("Encendido (desde el reposo)")
+        self.estatica.cerrar()
+        self.estatica = Estatica()                 # tubo de encendido + logo, como al arrancar
+        time.sleep(0.4)
+        if self.p_apagado:
+            self.p_apagado.terminate()
+            try:
+                self.p_apagado.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.p_apagado.kill()
+            self.p_apagado = None
+        self.series = buscar_series()
+        self.consolas = buscar_consolas()
+        if self.estado.datos.get("ultimo_modo") == "tv":
+            self.menu.seleccionar_tv()
+        else:
+            self.menu.seleccionar_serie(self.estado.datos.get("ultima"))
+        self.modo = "menu"
+        self.t_ocultar_estatica = ahora() + (3.4 if os.path.exists(LOGO_ARRANQUE) else 1.6)
+        self.t_input = self.t_ocultar_estatica
+        self.t_cuadro = 0
+
+    def paso_reposo(self, ords):
+        for o in ords:
+            if o == "apagar":                      # botón 1 mantenido: apagar de verdad
+                if self.p_apagado:
+                    self.p_apagado.terminate()
+                    self.p_apagado = None
+                self.apagar()
+                return
+            if o in ("despertar", "menu", "elegir", "arriba", "abajo"):
+                self.despertar()
+                return
+
+    def publicar_estado(self):
+        """/run/minitv/remoto.json: lo lee el control remoto del teléfono (minitv-remoto)."""
+        titulo = ""
+        if self.modo == "tv" and self.repro:
+            titulo = self.repro.nombre_canal if isinstance(self.repro, CanalTV) else self.repro.serie.nombre
+        elif self.modo == "juego" and self.partida:
+            titulo = self.partida.consola.titulo(self.partida.juego)
+        vlc = getattr(self.repro, "vlc", None) if self.modo == "tv" else None
+        datos = {"modo": self.modo, "volumen": self.estado.datos.get("volumen", 100), "titulo": titulo,
+                 "pausa": bool(getattr(vlc, "en_pausa", False))}
+        if datos != self._remoto_previo:
+            self._remoto_previo = datos
+            try:
+                tmp = os.path.join(RUN, "remoto.json.tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(datos, f, ensure_ascii=False)
+                os.replace(tmp, os.path.join(RUN, "remoto.json"))
+            except OSError:
+                pass
+
+    def ultima_serie(self):
+        ids = {s.id: s for s in self.series if s.episodios}
+        u = self.estado.datos.get("ultima")
+        return ids.get(u) or next(iter(ids.values()), None)
+
+    def reanudable(self):
+        """Lo que se reanuda al cerrar el menú o por inactividad: 'TV' (si fue lo último que se vio)
+        o la última serie (objeto Serie), o None."""
+        if self.estado.datos.get("ultimo_modo") == "tv" and any(s.episodios for s in self.series):
+            return "TV"
+        return self.ultima_serie()
+
+    def reanudar(self, que):
+        self.ver_tv(self.estado.datos.get("ultimo_canal")) if que == "TV" else self.ver(que)
+
+    # ----- transiciones -----
+    def ver(self, serie, inicio=None):
+        self._liberar_audio()
+        self.estatica.mostrar()
+        if not serie.episodios:
+            self.sin_senal()
+            return
+        self.repro = Reproduccion(serie, self.estado, self.estatica, inicio)
+        self.estado.datos["ultimo_modo"] = "serie"
+        self.estado.guardar()
+        self.modo = "tv"
+
+    def ver_tv(self, canal=None):
+        """Categoría TV: "Todo" (canal=None) o un canal de canales.txt (si ya no existe, "Todo")."""
+        self._liberar_audio()
+        suyas = dict(leer_canales(self.series)).get(canal) if canal else None
+        if canal and not suyas:
+            canal = None
+        self.repro = CanalTV(suyas or self.series, self.estado, self.estatica, self.menu, canal)
+        self.estado.datos["ultimo_modo"] = "tv"
+        self.estado.datos["ultimo_canal"] = canal
+        self.estado.guardar()
+        self.modo = "tv"
+
+    def jugar(self, consola, juego, nuevo=False):
+        """nuevo=True: desde el principio, sin cargar el estado guardado."""
+        self._liberar_audio()
+        self.estatica.mostrar(self.menu.rotulo_carga(consola, juego))   # estática + "Cargando…"
+        self.partida = Partida(consola, juego, self.estado, self.estatica, nuevo=nuevo)
+        self.modo = "juego"
+
+    def abrir_menu(self, consola_id=None):
+        """consola_id: al volver de un juego, abre la lista de juegos de esa consola."""
+        self.estatica.mostrar()
+        if self.repro:
+            self.repro.parar()
+            self.repro = None
+        if self.partida:
+            consola_id = self.partida.consola.id
+            self.partida.parar()
+            self.partida = None
+            self.estado.guardar()
+        self.cerrar_aux()
+        self.series = buscar_series()
+        self.consolas = buscar_consolas()
+        if consola_id:
+            self.menu.seleccionar_juego(consola_id)
+        elif self.estado.datos.get("ultimo_modo") == "tv":
+            self.menu.seleccionar_tv()
+        else:
+            self.menu.seleccionar_serie(self.estado.datos.get("ultima"))
+        self.modo = "menu"
+        self.t_ocultar_estatica = ahora() + 0.5
+        self.t_input = self.t_ocultar_estatica
+        log("Menú")
+
+    def sin_senal(self):
+        log("SIN SEÑAL")
+        self.cerrar_aux()
+        if os.path.exists(SIN_SENAL):
+            self.vlc_aux = VLC([(SIN_SENAL, 0)], audio=False)
+        self.modo = "sin_senal"
+        self.t_aux = ahora()
+
+    def cerrar_aux(self):
+        if self.vlc_aux:
+            self.vlc_aux.cerrar()
+            self.vlc_aux = None
+
+    def apagar(self):
+        log("Apagando")
+        if self.repro:
+            self.repro.parar()
+            self.repro = None
+        if self.partida:
+            self.partida.parar()                   # que RetroArch guarde la partida antes
+            self.partida = None
+        self.estado.guardar()
+        subprocess.Popen([ESTATICA, "apagado"])   # animación de apagado sobre lo que se ve
+        time.sleep(1.0)
+        subprocess.run(["sudo", "-n", "systemctl", "poweroff"])
+        self.modo = "apagando"
+
+    # ----- bucle -----
+    def paso_menu(self, ords):
+        for o in ords:
+            self.t_input = ahora()
+            if o == "reposo":
+                self.reposo()
+                return
+            if self.menu.remoto_pantalla and o != "apagar":   # Ajustes → Control remoto: cualquier botón cierra
+                self.menu.remoto_pantalla = False
+                continue
+            if o in ("lado-", "lado+"):
+                self.menu.lado(-1 if o == "lado-" else 1)
+            elif o == "inicio":
+                self.menu.inicio()
+            elif o in ("vol+", "vol-"):
+                v = max(0, min(100, self.estado.datos.get("volumen", 100) + (5 if o == "vol+" else -5)))
+                self.estado.datos["volumen"] = v
+                self.estado.guardar()
+                self.aviso = (f"Volumen {v}%", ahora() + 2)
+            elif o == "abajo" or o == "girar+":
+                self.menu.abajo()
+            elif o == "arriba" or o == "girar-":
+                self.menu.arriba()
+            elif o == "elegir":
+                accion = self.menu.elegir()
+                if accion and accion[0] == "ver":
+                    self.ver(accion[1])
+                    return
+                if accion and accion[0] == "ver_tv":
+                    self.ver_tv(accion[1])
+                    return
+                if accion and accion[0] == "ahora_suena":
+                    self.tras_musica = None
+                    self.fuente = self.musica_activa()
+                    self.mostrar_musica()
+                    return
+                if accion and accion[0] == "ver_episodio":
+                    self.ver(accion[1], inicio=(accion[2], 0))
+                    return
+                if accion and accion[0] == "abrir_serie":
+                    self.menu.abrir_serie(accion[1])
+                if accion and accion[0] == "abrir_consola":
+                    self.menu.abrir_consola(accion[1])
+                if accion and accion[0] == "jugar":
+                    self.jugar(accion[1], accion[2])
+                    return
+                if accion and accion[0] == "jugar_nuevo":
+                    self.jugar(accion[1], accion[2], nuevo=True)
+                    return
+                if accion and accion[0] == "aviso":
+                    self.aviso = (accion[1], ahora() + 4)
+                if accion and accion[0] == "volumen_ciclo":
+                    v = self.estado.datos.get("volumen", 100)
+                    self.estado.datos["volumen"] = 25 if v >= 100 else min(100, (v // 25 + 1) * 25)
+                    self.estado.guardar()
+                if accion and accion[0] == "apagar":
+                    self.apagar()
+                    return
+            elif o == "menu" and self.menu.bt_pantalla:     # en Bluetooth: un nivel atrás
+                self.menu.volver_bt()
+            elif o == "menu" and self.menu.serie_abierta:   # en la lista de episodios: volver a series
+                self.menu.cerrar_serie()
+            elif o == "menu" and self.menu.consola_abierta:  # en la lista de juegos: volver a consolas
+                self.menu.cerrar_consola()
+            elif o == "menu":                      # cerrar el menú = volver a la última serie (o a TV)
+                r = self.reanudable()
+                if r:
+                    self.reanudar(r)
+                    return
+            elif o == "apagar":
+                self.apagar()
+                return
+        t = ahora()
+        restante = ESPERA_REANUDAR - (t - self.t_input)
+        # En Juegos no se reanuda la serie sola: quien está ahí quiere elegir un juego
+        # En Bluetooth tampoco: puede estar esperando a que se escriba un código
+        # ...ni mientras suena Spotify (la TV le quitaría el audio)
+        ultima = (None if self.menu.en_juegos() or self.menu.bt_pantalla or self.musica_activa()
+                  or self.bt.visible() or self.menu.remoto_pantalla else self.reanudable())
+        nombre = ((self.estado.datos.get("ultimo_canal") or "TV") if ultima == "TV"
+                  else getattr(ultima, "nombre", ""))
+        if ultima and restante <= 0 and not self.estatica.visible:
+            log(f"Sin actividad: reanudar {nombre}")
+            self.reanudar(ultima)
+            return
+        intervalo = 1 / 30 if self.menu.animando() else 1 / 10
+        if t - self.t_cuadro >= intervalo:
+            self.t_cuadro = t
+            aviso = (f"Reanudando {nombre} en {math.ceil(restante)}…"
+                     if ultima and not self.estatica.visible else None)
+            if self.aviso and t < self.aviso[1]:
+                aviso = self.aviso[0]
+            self.fb.mostrar(self.menu.dibujar(aviso))
+        if self.estatica.visible and t >= self.t_ocultar_estatica:
+            self.estatica.ocultar()
+            self.t_input = t
+
+    def paso_tv(self, ords):
+        for o in ords:
+            if o in ("menu", "elegir"):          # cualquier botón del mando abre el menú
+                self.abrir_menu()
+                return
+            if o == "reposo":
+                self.reposo()
+                return
+            if o in ("canal+", "canal-"):
+                self.cambiar_canal(1 if o == "canal+" else -1)
+                return
+            if o == "info" and isinstance(self.repro, CanalTV):
+                self.repro.info()
+            if o == "pausa":
+                self.repro.vlc.pausa()
+            if o == "apagar":
+                self.apagar()
+                return
+            if o in ("girar+", "girar-"):
+                self.repro.volumen(5 if o == "girar+" else -5)
+        if self.repro.tick() == "fin":
+            corto = ahora() - self.repro.vlc.t_inicio < 5
+            log("VLC terminó" + (" enseguida: error" if corto else ""))
+            self.repro.parar()
+            self.repro = None
+            self.estatica.mostrar()
+            if corto:
+                self.sin_senal()
+            else:
+                self.abrir_menu()
+
+    def paso_juego(self, ords):
+        for o in ords:
+            if o == "menu":                        # botón 1 corto: volver a la TV (RetroArch guarda)
+                self.abrir_menu()
+                return
+            if o == "reposo":
+                self.reposo()
+                return
+            if o == "apagar":
+                self.apagar()
+                return
+            if o in ("girar+", "girar-"):
+                self.partida.volumen(5 if o == "girar+" else -5)
+        if self.partida.tick() == "fin":           # salió solo (Esc, Select+Start) o falló
+            p = self.partida
+            corto = ahora() - p.t_inicio < 4
+            log(f"RetroArch terminó (código {p.proc.returncode})" + (": no pudo abrir el juego" if corto else ""))
+            self.abrir_menu()
+            if corto:
+                self.aviso = (f"No se pudo abrir {p.consola.titulo(p.juego)}", ahora() + 5)
+
+    # ----- Música (Spotify Connect) -----
+    def musica_activa(self):
+        """La fuente de música que está sonando (o en pausa en la TV), o None."""
+        return next((f for f in (self.telefono, self.spotify) if f.activo()), None)
+
+    def _liberar_audio(self):
+        """Antes de un episodio o un juego: si suena música, cortarla (la tarjeta de audio no se comparte)."""
+        f = self.musica_activa()
+        if f:
+            f.cortar()
+            time.sleep(0.3)
+
+    def atender_spotify(self):
+        """Fuentes de música: el teléfono por Bluetooth y Spotify Connect (desactivado, ver memoria)."""
+        for fuente in (self.telefono, self.spotify):
+            cambios = fuente.poll()
+            if "volumen" in cambios and fuente.volumen is not None:
+                v = round(fuente.volumen * 100 / 65535)          # el volumen del teléfono es el de la TV
+                if v != self.estado.datos.get("volumen"):
+                    self.estado.datos["volumen"] = v
+                    self.estado.guardar()
+                    log(f"Volumen {v}% (desde {fuente.origen})")
+            if "estado" in cambios:
+                log(f"{fuente.origen}: {fuente.estado}")
+                if fuente.sonando() and self.modo in ("tv", "menu", "sin_senal"):
+                    self.entrar_musica(fuente)
+                elif self.modo == "musica" and fuente is self.fuente and not fuente.activo():
+                    self.salir_musica(cortar=False)         # se terminó o se desconectó
+
+    def entrar_musica(self, fuente):
+        """Empieza la música: guarda lo que se veía (se retoma con el botón 1) y libera el audio."""
+        self.fuente = fuente
+        self.tras_musica = None
+        if self.repro:
+            self.tras_musica = "TV" if isinstance(self.repro, CanalTV) else self.repro.serie
+            self.repro.parar()                              # guarda el segundo exacto del episodio
+            self.repro = None
+        self.cerrar_aux()
+        if hasattr(fuente, "iniciar_audio"):
+            fuente.iniciar_audio()                          # el teléfono: recién ahora, con el audio libre
+        self.mostrar_musica()
+
+    def mostrar_musica(self):
+        self.estatica.mostrar()
+        self.modo = "musica"
+        self.t_ocultar_estatica = ahora() + 0.4
+        self.t_cuadro = 0
+        log("Ahora suena" + (f" (después: {getattr(self.tras_musica, 'nombre', self.tras_musica)})"
+                             if self.tras_musica else ""))
+
+    def salir_musica(self, cortar=True):
+        if self.fuente:
+            if cortar:
+                self.fuente.cortar()
+            elif hasattr(self.fuente, "detener_audio"):
+                self.fuente.detener_audio()
+        destino, self.tras_musica = self.tras_musica, None
+        if destino:
+            self.estatica.mostrar()
+            self.reanudar(destino)
+        else:
+            self.abrir_menu()
+
+    def paso_musica(self, ords):
+        for o in ords:
+            if o == "menu":                                 # botón 1: volver a la TV
+                self.salir_musica(cortar=True)
+                return
+            if o == "reposo":
+                self.reposo()
+                return
+            if o == "apagar":
+                self.apagar()
+                return
+        t = ahora()
+        if t - self.t_cuadro >= 0.25:
+            self.t_cuadro = t
+            self.fb.mostrar(self.menu.dibujar_ahora_suena(self.fuente or self.telefono))
+        if self.estatica.visible and t >= self.t_ocultar_estatica:
+            self.estatica.ocultar()
+
+    def paso_sin_senal(self, ords):
+        if self.estatica.visible and self.vlc_aux and self.vlc_aux.conectar():
+            if self.vlc_aux.cuadros_mostrados():
+                self.estatica.ocultar()
+        if "reposo" in ords:
+            self.reposo()
+        elif "apagar" in ords:
+            self.cerrar_aux()
+            self.apagar()
+        elif ords or ahora() - self.t_aux > 5:
+            self.abrir_menu()
+
+    def bucle(self):
+        while not self.salir:
+            ords = self.traducir(self.ordenes())
+            self.atender_spotify()
+            self.bt.revisar(self.menu.bt_pantalla is not None)
+            if ords:
+                log("Órdenes:", ", ".join(ords))
+            if self.modo == "menu":
+                self.paso_menu(ords)
+            elif self.modo == "tv":
+                self.paso_tv(ords)
+            elif self.modo == "sin_senal":
+                self.paso_sin_senal(ords)
+            elif self.modo == "juego":
+                self.paso_juego(ords)
+            elif self.modo == "musica":
+                self.paso_musica(ords)
+            elif self.modo == "reposo":
+                self.paso_reposo(ords)
+            self.publicar_estado()
+            time.sleep(0.01 if self.modo == "menu" and self.menu.animando() else 0.03)
+        self.cerrar()
+
+    def cerrar(self):
+        log("Saliendo")
+        if self.repro:
+            self.repro.parar()
+        if self.partida:
+            self.partida.parar()
+        self.telefono.detener_audio()
+        self.bt.cerrar_sesion()
+        self.cerrar_aux()
+        self.estado.guardar()
+        self.estatica.cerrar()
+        self.fb.negro()
+        try:
+            os.unlink(SOCK_CONTROL)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    TV().bucle()
