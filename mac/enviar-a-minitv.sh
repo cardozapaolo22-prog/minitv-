@@ -71,7 +71,22 @@ if [ ${#VIDEOS[@]} -gt 0 ]; then
     TUNE=(); [ "$tipo" = "Imagen real (personas)" ] && TUNE=(-t none)
     avisar "Convirtiendo y subiendo ${#VIDEOS[@]} videos a ${SERIE#* }… (te aviso al terminar)"
     log "videos -> $SERIE (${tipo})"
-    ( cd "$DIR" && /usr/bin/caffeinate -i ./recodificar-minitv.sh -c "$SERIE" -e "${TUNE[@]+"${TUNE[@]}"}" "${VIDEOS[@]}" ) >> "$REG" 2>&1
+    # Nombres limpios ("Batman.La.broma.asesina.2016.DVDrip-lat" -> "Batman La broma asesina (2016)"),
+    # con la misma regla que la TV (limpiar_titulo de minitv_admin); el video se convierte con ese nombre
+    ENLACES=$(mktemp -d)
+    LIMPIOS=()
+    i=0
+    while IFS= read -r limpio; do
+        f="${VIDEOS[$i]}"; i=$((i + 1))
+        [ -n "$limpio" ] || limpio=$(basename "${f%.*}")
+        limpio=${limpio//\//-}
+        ln -s "$f" "$ENLACES/$limpio.${f##*.}" 2>/dev/null && LIMPIOS+=("$ENLACES/$limpio.${f##*.}") || LIMPIOS+=("$f")
+    done < <(for f in "${VIDEOS[@]}"; do b=$(basename "$f"); echo "${b%.*}"; done | "${SSH[@]}" "$PI" \
+             'python3 -c "import sys; sys.path.insert(0, \"/usr/local/lib/minitv\"); from minitv_admin import limpiar_titulo as L; [print(L(l.rstrip(chr(10)))) for l in sys.stdin]"' 2>>"$REG" \
+             || for f in "${VIDEOS[@]}"; do echo; done)
+    [ ${#LIMPIOS[@]} -eq ${#VIDEOS[@]} ] || LIMPIOS=("${VIDEOS[@]}")
+    ( cd "$DIR" && /usr/bin/caffeinate -i ./recodificar-minitv.sh -c "$SERIE" -e "${TUNE[@]+"${TUNE[@]}"}" "${LIMPIOS[@]}" ) >> "$REG" 2>&1
+    rm -rf "$ENLACES"
     "${SSH[@]}" "$PI" minitv-normalizar >> "$REG" 2>&1 || true
     subidos=$(ls -1 "$DIR/minitv_320x240/$SERIE" 2>/dev/null | wc -l | tr -d ' ')
     RESUMEN+="Videos: ${#VIDEOS[@]} enviados a «${SERIE#* }» (en la TV hay $subidos de esta serie).\n"

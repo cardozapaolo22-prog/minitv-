@@ -87,6 +87,41 @@ def _borrar_silencioso(ruta):
         pass
 
 
+# Etiquetas de descarga que no son parte del título (se comparan en minúsculas, sin puntos)
+ETIQUETAS = {
+    "dvdrip", "bdrip", "brrip", "bluray", "webrip", "webdl", "web", "dl", "hdrip", "hdtv", "dvdscr", "dvd", "tsrip",
+    "camrip", "cam", "hdcam", "x264", "x265", "h264", "h265", "hevc", "avc", "xvid", "divx", "aac", "ac3", "dts",
+    "mp3", "dd51", "51", "2160p", "1080p", "720p", "480p", "360p", "4k", "uhd", "hd", "sd", "lat", "latino",
+    "castellano", "espanol", "español", "spanish", "esp", "eng", "english", "dual", "sub", "subs", "subtitulado",
+    "vose", "proper", "repack", "internal", "limited", "extended", "unrated", "remastered", "yify", "yts", "rarbg",
+    "retrotve", "seriesretro", "serieslan", "com", "net", "org", "www", "mkv", "mp4", "avi", "torrent",
+}
+
+
+def limpiar_titulo(nombre):
+    """'Batman.La.broma.asesina.2016.DVDrip-lat' -> 'Batman La broma asesina (2016)'.
+    Quita puntos y guiones bajos, etiquetas de descarga (DVDrip, 1080p, x264, Latino...), sitios web
+    y lo que va entre corchetes; el año queda entre paréntesis. Respeta 1x01, S01E02, etc."""
+    original = nombre
+    nombre = re.sub(r"\[[^\]]*\]", " ", nombre)                       # [grupo], [www.sitio.com]
+    nombre = re.sub(r"(?i)\bwww\.[^\s]+", " ", nombre)
+    nombre = re.sub(r"(?<!\d)\.|\.(?!\d{1,2}\b)|_", " ", nombre)      # puntos (no los de 1.5 o 5.1) y _
+    partes = []
+    for p in nombre.split():
+        trozos = [t for t in re.split(r"-", p) if t]
+        utiles = [t for t in trozos if re.sub(r"[^0-9a-záéíóúñ]", "", t.lower()) not in ETIQUETAS]
+        if trozos and not utiles:
+            continue                                                  # p. ej. "DVDrip-lat"
+        partes.append("-".join(utiles) if len(utiles) < len(trozos) else p)
+    t = " ".join(partes)
+    t = re.sub(r"\(\s*\)", "", t)
+    t = re.sub(r"(?<![\d(])\b(19[3-9]\d|20[0-4]\d)\b(?![\d)])", r"(\1)", t)   # año suelto -> (2016)
+    t = re.sub(r"\s+", " ", t).strip(" -–·")
+    if not t or re.fullmatch(r"\(\d{4}\)", t):                      # solo un año: mejor el nombre tal cual
+        return original.strip()
+    return t
+
+
 def orden_natural(t):
     return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", t)]
 
@@ -224,6 +259,12 @@ class Conversor(threading.Thread):
         for t in self.tareas:                              # lo que se cortó por un reinicio, otra vez
             if t.get("estado") in ("convirtiendo", "cancelando"):
                 t["estado"], t["progreso"] = "esperando", 0
+            if t.get("estado") == "esperando":            # (con el nombre limpio, si se subió antes)
+                t["nombre"] = limpiar_titulo(t["nombre"])
+        for _, _, carpeta in series():                     # restos de conversiones cortadas por un reinicio
+            for f in os.listdir(carpeta):
+                if f.startswith(".") and f.endswith(".parte.mp4"):
+                    _borrar_silencioso(os.path.join(carpeta, f))
 
     def _guardar(self):
         os.makedirs(SUBIDAS, exist_ok=True)
@@ -755,7 +796,7 @@ class Admin:
         destino = os.path.join(SUBIDAS, secrets.token_hex(8) + os.path.splitext(archivo)[1].lower())
         if not self._recibir_archivo(h, destino):
             return self._json(h, 400, {"ok": False, "error": "La subida se cortó. Vuelve a intentarlo."})
-        nombre = re.sub(r"\s+", " ", os.path.splitext(archivo)[0].replace("_", " ")).strip()
+        nombre = limpiar_titulo(os.path.splitext(archivo)[0])
         self.conversor.agregar(destino, sid, nombre)
         log(f"video subido: {archivo} -> {sid}")
         return self._json(h, 200, {"ok": True, "serie": sid})
