@@ -103,6 +103,7 @@ def limpiar_titulo(nombre):
     Quita puntos y guiones bajos, etiquetas de descarga (DVDrip, 1080p, x264, Latino...), sitios web
     y lo que va entre corchetes; el año queda entre paréntesis. Respeta 1x01, S01E02, etc."""
     original = nombre
+    nombre = re.sub(r"\s+\.\s+", " · ", nombre)                       # "Historia 1 . Historia 2"
     nombre = re.sub(r"\[[^\]]*\]", " ", nombre)                       # [grupo], [www.sitio.com]
     nombre = re.sub(r"(?i)\bwww\.[^\s]+", " ", nombre)
     nombre = re.sub(r"(?<!\d)\.|\.(?!\d{1,2}\b)|_", " ", nombre)      # puntos (no los de 1.5 o 5.1) y _

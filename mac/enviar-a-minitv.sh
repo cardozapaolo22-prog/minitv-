@@ -5,7 +5,8 @@
 # Para borrar u ordenar: página Administrar del control (http://minitv.local/admin.html).
 # Solo herramientas de macOS + ffmpeg (el mismo que usa recodificar-minitv.sh).
 set -uo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Abierta desde el Escritorio, la app no hereda el PATH de la Terminal: buscar ffmpeg donde suele estar
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/bin:$PATH"
 DIR="${MINITV_CARPETA:-$HOME/minitv}"              # donde están recodificar-minitv.sh y enviar-juegos
 PI="${MINITV_HOST:-paolo@raspberrypi.local}"
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
@@ -44,6 +45,9 @@ if [ ${#VIDEOS[@]} -eq 0 ] && [ ${#JUEGOS[@]} -eq 0 ]; then
     ventana "No encontré videos ni juegos en lo que arrastraste." caution; exit 0
 fi
 
+if [ ${#VIDEOS[@]} -gt 0 ] && ! command -v ffmpeg >/dev/null; then
+    ventana "Para convertir videos falta ffmpeg en esta Mac (no lo encuentro en ~/.local/bin, /opt/homebrew/bin ni /usr/local/bin)." caution; exit 1
+fi
 if ! "${SSH[@]}" "$PI" true 2>>"$REG"; then
     ventana "No encuentro la MiniTV. ¿Está encendida y conectada al mismo wifi que esta Mac?" caution; exit 1
 fi
@@ -85,11 +89,26 @@ if [ ${#VIDEOS[@]} -gt 0 ]; then
              'python3 -c "import sys; sys.path.insert(0, \"/usr/local/lib/minitv\"); from minitv_admin import limpiar_titulo as L; [print(L(l.rstrip(chr(10)))) for l in sys.stdin]"' 2>>"$REG" \
              || for f in "${VIDEOS[@]}"; do echo; done)
     [ ${#LIMPIOS[@]} -eq ${#VIDEOS[@]} ] || LIMPIOS=("${VIDEOS[@]}")
-    ( cd "$DIR" && /usr/bin/caffeinate -i ./recodificar-minitv.sh -c "$SERIE" -e "${TUNE[@]+"${TUNE[@]}"}" "${LIMPIOS[@]}" ) >> "$REG" 2>&1
+    SALIDA_REC=$(mktemp)
+    ( cd "$DIR" && /usr/bin/caffeinate -i ./recodificar-minitv.sh -c "$SERIE" -e "${TUNE[@]+"${TUNE[@]}"}" "${LIMPIOS[@]}" ) > "$SALIDA_REC" 2>&1
+    cat "$SALIDA_REC" >> "$REG"
     rm -rf "$ENLACES"
     "${SSH[@]}" "$PI" minitv-normalizar >> "$REG" 2>&1 || true
-    subidos=$(ls -1 "$DIR/minitv_320x240/$SERIE" 2>/dev/null | wc -l | tr -d ' ')
-    RESUMEN+="Videos: ${#VIDEOS[@]} enviados a «${SERIE#* }» (en la TV hay $subidos de esta serie).\n"
+    # Lo que de verdad pasó: "Listo: N recodificados, M ya existían, F fallidos" y lo que hay en la TV
+    read -r ok ya fallos < <(sed -nE 's/^Listo: ([0-9]+) recodificados, ([0-9]+) ya exist[^,]*, ([0-9]+) fallidos.*/\1 \2 \3/p' "$SALIDA_REC" | tail -1)
+    en_tv=$("${SSH[@]}" "$PI" "ls -1 videos/$(printf '%q' "$SERIE") 2>/dev/null | wc -l" 2>/dev/null | tr -d ' ')
+    if [ -z "${ok:-}" ]; then
+        error=$(grep -m1 -E '^Error' "$SALIDA_REC" | tr -d '"\\')
+        rm -f "$SALIDA_REC"
+        log "FALLÓ la conversión: ${error:-sin detalle}"
+        ventana "No se pudieron convertir los videos.\n\n${error:-Revisa el registro: minitv/enviar-a-minitv.log}" caution
+        exit 1
+    fi
+    rm -f "$SALIDA_REC"
+    RESUMEN+="Videos de «${SERIE#* }»: $ok convertidos y subidos"
+    [ "${ya:-0}" -gt 0 ] && RESUMEN+=", $ya ya estaban"
+    [ "${fallos:-0}" -gt 0 ] && RESUMEN+=", $fallos NO se pudieron convertir"
+    RESUMEN+=". En la TV hay ${en_tv:-?} episodios de esta serie.\n"
 fi
 
 # ----- juegos -----
