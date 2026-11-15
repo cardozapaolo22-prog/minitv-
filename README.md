@@ -69,6 +69,44 @@ y **📺 Control** (vuelve al control de TV).
 
 ---
 
+## Administrar (añadir y borrar videos y juegos, sin Claude)
+
+Desde el control: **⚙️ Administrar** (`http://minitv.local/admin.html`), con un **PIN** de 4 números
+que aparece en la TV en **Ajustes → Control remoto** (se cambia en Administrar → Ajustes).
+
+* **Videos**: elegir la serie (o crear una nueva), elegir los videos del celular o la computadora y
+  subirlos con barra de progreso. La TV los convierte sola a 320x240 (ffmpeg, más o menos lo que dura
+  cada video, con prioridad baja y en pausa mientras alguien juega) y aparecen en Series y en su canal.
+  Borrar episodios o series completas.
+* **Juegos**: subir juegos (la consola se detecta sola: .gb .gbc .gba .nes .sfc .smc .md .gen .bin
+  .cue .chd .pbp .zip); la portada se busca sola en libretro si hay internet. Borrar juegos (las
+  partidas guardadas se conservan).
+* **Canales**: qué series van en cada canal, crear o quitar canales, subir su logo y elegir la
+  esquina de la mosca (escribe `~/videos/canales.txt`).
+* **Ajustes**: wifi de casa (guardar u olvidar redes; la clave se guarda cifrada) y cambiar el PIN.
+
+Archivos: `pi/remoto/minitv_admin.py` (→ `/usr/local/lib/minitv/`), `pi/remoto/web/admin.html`,
+`pi/remoto/minitv-wifi` (→ `/usr/local/sbin/`, lo usa la página con `sudo -n`). Necesita `ffmpeg`
+en la Pi.
+
+### Apps de la Mac (`mac/`, se instalan con `mac/instalar-app.sh`)
+
+* **Enviar a MiniTV**: arrastrar videos, juegos o carpetas encima del ícono. Pregunta la serie (o una
+  nueva) y si son dibujos o imagen real, convierte en la Mac (mucho más rápido que en la TV) con
+  `recodificar-minitv.sh` y sube; los juegos van con `enviar-juegos` (con portada). Avisa al terminar.
+  Registro: `~/minitv/enviar-a-minitv.log`.
+* **Imagen para otra MiniTV**: imagen limpia del sistema para armar otra TV igual
+  (ver [GUIA-ARMADO.md](GUIA-ARMADO.md)).
+
+---
+
+## Otra Mini TV igual
+
+Ver **[GUIA-ARMADO.md](GUIA-ARMADO.md)**: piezas, conexiones, cómo grabar la imagen limpia
+(`sudo minitv-imagen --limpia`, sin nada personal) y la primera configuración desde el celular.
+
+---
+
 ## Red wifi propia ("MiniTV")
 
 `minitv-red` (servicio `minitv-red.service`) al encender:
