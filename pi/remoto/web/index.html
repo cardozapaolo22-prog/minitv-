@@ -69,43 +69,72 @@ button { font: inherit; color: inherit; border: 0; padding: 0; cursor: pointer; 
   box-shadow: 0 8px 24px rgba(0,0,0,.5); text-align: center; }
 #aviso.visible { display: block; }
 
-/* ---------- modo mando ---------- */
-#mando { position: fixed; inset: 0; z-index: 20; display: none; touch-action: none;
-  background: radial-gradient(ellipse at 50% 120%, #3a3f47, #1b1e22 70%); color: #dfe4ea; }
+/* ---------- modo mando: un mando plateado de consola, a juego con el control ---------- */
+#mando { position: fixed; inset: 0; z-index: 20; display: none; touch-action: none; overflow: hidden;
+  background: radial-gradient(ellipse at 50% 30%, #2a2e35, #101215 75%); }
 body.en-mando #control { display: none; }
 body.en-mando #mando { display: block; }
 #girar { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column;
-  gap: 12px; font-size: 20px; text-align: center; padding: 30px; background: #1b1e22; z-index: 5; }
-#girar b { font-size: 54px; }
+  gap: 14px; font-size: 20px; text-align: center; padding: 30px; background: #16181c; color: #dfe4ea; z-index: 5; }
+#girar b { font-size: 60px; color: #9fdcff; animation: girar 1.8s ease-in-out infinite; }
+@keyframes girar { 50% { transform: rotate(90deg); } }
 @media (orientation: portrait) { #girar { display: flex; } }
-.mb { position: absolute; display: flex; align-items: center; justify-content: center; font-weight: 800; color: #fff;
-  border-radius: 50%; box-shadow: 0 4px 0 rgba(0,0,0,.45), inset 0 2px 2px rgba(255,255,255,.35); }
-.mb.on { transform: scale(.92); filter: brightness(1.25); }
-#dpad { position: absolute; left: 4vw; top: 50%; width: min(42vh, 30vw); aspect-ratio: 1; transform: translateY(-38%); }
-#dpad .brazo { position: absolute; background: linear-gradient(#4b5058, #2c3036); box-shadow: 0 4px 0 #111, inset 0 1px 1px rgba(255,255,255,.2); }
-#dpad .v { left: 33%; width: 34%; top: 0; height: 100%; border-radius: 12px; }
-#dpad .h { top: 33%; height: 34%; left: 0; width: 100%; border-radius: 12px; }
-#dpad .marca-d { position: absolute; color: #9aa3ad; font-size: 4.5vh; }
-#dpad .marca-d.on { color: #fff; }
-.rombo { position: absolute; right: 4vw; top: 50%; width: min(46vh, 32vw); aspect-ratio: 1; transform: translateY(-38%); }
-.rombo .mb { width: 34%; height: 34%; font-size: 5.5vh; }
-#b-x { left: 33%; top: 0; background: radial-gradient(circle at 35% 30%, #6aa5ff, #2a6fd6 65%, #194a96); }
-#b-a { right: 0; top: 33%; background: radial-gradient(circle at 35% 30%, #ff7d74, #d9231a 65%, #8d0e08); }
-#b-b { left: 33%; bottom: 0; background: radial-gradient(circle at 35% 30%, #ffe27a, #e8b400 65%, #9c7900); color: #3b2f00; }
-#b-y { left: 0; top: 33%; background: radial-gradient(circle at 35% 30%, #c2c7ce, #8a9099 65%, #5b6068); }
-.gatillo { position: absolute; top: 3vh; width: 24vw; height: 13vh; border-radius: 14px 14px 22px 22px; font-size: 4.2vh;
-  background: linear-gradient(#5a5f67, #2c3036); box-shadow: 0 4px 0 #111, inset 0 1px 1px rgba(255,255,255,.25); }
-#b-l { left: 3vw; } #b-r { right: 3vw; }
-.centro { position: absolute; left: 50%; transform: translateX(-50%); display: flex; gap: 3vw; }
-.pildora { position: relative; width: 15vw; height: 8vh; border-radius: 999px; font-size: 2.6vh; letter-spacing: 1px;
-  background: linear-gradient(#5a5f67, #2c3036); box-shadow: 0 3px 0 #111, inset 0 1px 1px rgba(255,255,255,.2); }
-#fila-sel { bottom: 9vh; }
-#fila-sup { top: 4vh; }
-.chico { position: relative; height: 8vh; padding: 0 3vw; border-radius: 999px; font-size: 2.6vh; font-weight: 700; color: #fff;
+
+.cuerpo { position: absolute; top: 13vh; bottom: 4vh; left: max(2.5vw, env(safe-area-inset-left)); right: max(2.5vw, env(safe-area-inset-right));
+  border-radius: 45vh; background: linear-gradient(100deg, var(--plata2) 0%, var(--plata1) 20%, #dfe3e8 50%, var(--plata1) 78%, var(--plata3) 100%);
+  box-shadow: inset 0 3px 2px #fff, inset 0 -6px 12px rgba(0,0,0,.28), 0 14px 30px rgba(0,0,0,.65); }
+.gatillo { position: absolute; top: 4vh; width: min(26vw, 52vh); height: 15vh; z-index: 0; display: flex; align-items: flex-start;
+  justify-content: center; padding-top: 2.2vh; font: 800 4.2vh/1 -apple-system, sans-serif; color: #4a5059;
+  background: linear-gradient(#e9ecef, #a9b0b8); border-radius: 6vh 6vh 2vh 2vh;
+  box-shadow: inset 0 2px 1px #fff, 0 3px 6px rgba(0,0,0,.5); transition: transform .05s; }
+#b-l { left: calc(max(2.5vw, env(safe-area-inset-left)) + 7vw); }
+#b-r { right: calc(max(2.5vw, env(safe-area-inset-right)) + 7vw); }
+.gatillo.on { transform: translateY(1.2vh); filter: brightness(.9); }
+
+.pozo { position: absolute; top: 50%; transform: translateY(-50%); width: min(66vh, 34vw); aspect-ratio: 1; border-radius: 50%;
+  background: radial-gradient(circle at 50% 40%, #b9bfc7, #9aa1aa);
+  box-shadow: inset 0 4px 10px rgba(0,0,0,.35), inset 0 -2px 2px rgba(255,255,255,.7), 0 1px 0 #fff; }
+.pozo.izq { left: 4vh; }
+.pozo.der { right: 4vh; background: radial-gradient(circle at 50% 40%, #4a4f57, #2b2f35); }
+
+#dpad { position: absolute; inset: 11%; }
+#dpad .brazo { position: absolute; background: linear-gradient(145deg, #4b5058, #24272c);
+  box-shadow: 0 0.8vh 0 #15171a, 0 1.4vh 2vh rgba(0,0,0,.35), inset 0 1px 1px rgba(255,255,255,.18); }
+#dpad .v { left: 34%; width: 32%; top: 0; height: 100%; border-radius: 1.6vh; }
+#dpad .h { top: 34%; height: 32%; left: 0; width: 100%; border-radius: 1.6vh; }
+#dpad .cubo { position: absolute; left: 34%; top: 34%; width: 32%; height: 32%; border-radius: 50%;
+  background: radial-gradient(circle, #2a2d32 0 40%, transparent 42%); }
+#dpad .marca-d { position: absolute; color: #8f98a3; font-size: 4.6vh; line-height: 1; transition: color .05s; }
+#dpad .marca-d.on { color: #9fdcff; text-shadow: 0 0 1.5vh #9fdcff; }
+
+.rombo { position: absolute; inset: 9%; }
+.rombo .mb { position: absolute; width: 33%; height: 33%; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font: 900 5.6vh/1 -apple-system, sans-serif; color: rgba(255,255,255,.92); text-shadow: 0 -1px 0 rgba(0,0,0,.35);
+  box-shadow: 0 1vh 0 rgba(0,0,0,.55), 0 1.6vh 2vh rgba(0,0,0,.4), inset 0 0.5vh 0.6vh rgba(255,255,255,.45), inset 0 -0.6vh 1vh rgba(0,0,0,.25);
+  transition: transform .05s, box-shadow .05s; }
+.rombo .mb.on { transform: translateY(0.8vh); box-shadow: 0 0.2vh 0 rgba(0,0,0,.55), inset 0 0.6vh 1vh rgba(0,0,0,.35); }
+#b-x { left: 33.5%; top: 0; background: radial-gradient(circle at 35% 28%, #7fb2ff, #2a6fd6 60%, #174289); }
+#b-a { right: 0; top: 33.5%; background: radial-gradient(circle at 35% 28%, #ff8a80, #d9231a 60%, #870d08); }
+#b-b { left: 33.5%; bottom: 0; background: radial-gradient(circle at 35% 28%, #ffe58a, #e3ae00 60%, #957100); color: #4a3a00; text-shadow: none; }
+#b-y { left: 0; top: 33.5%; background: radial-gradient(circle at 35% 28%, #d3d7dc, #8a9099 60%, #565b63); }
+
+.medio { position: absolute; top: 0; bottom: 0; left: calc(4vh + min(66vh, 34vw)); right: calc(4vh + min(66vh, 34vw));
+  display: flex; flex-direction: column; align-items: center; justify-content: space-evenly; padding: 3vh 0; }
+.marca-m { font: 900 5.4vh/1 -apple-system, sans-serif; letter-spacing: 1.1vh; color: #4a5059; text-shadow: 0 1px 0 #fff, 0 -1px 0 rgba(0,0,0,.25); }
+#jugador { background: #0d1a14; color: #7dffb2; border-radius: 1.2vh; padding: 1vh 2.4vh; font: 700 3.2vh/1.2 ui-monospace, Menlo, monospace;
+  box-shadow: inset 0 0.4vh 1vh rgba(0,0,0,.8), 0 1px 0 #fff; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.selstart { display: flex; gap: 4vh; }
+.ss { display: flex; flex-direction: column; align-items: center; gap: 1vh; font: 800 2.4vh/1 -apple-system, sans-serif; letter-spacing: .3vh; color: #5a6069; }
+.ranura { padding: 0.9vh; border-radius: 99px; background: #aab0b8; box-shadow: inset 0 0.4vh 0.8vh rgba(0,0,0,.35), 0 1px 0 #fff; transform: rotate(-22deg); }
+.pildora { width: 11vh; height: 4vh; border-radius: 99px; background: linear-gradient(#5a5f67, #2c3036);
+  box-shadow: 0 0.6vh 0 #15171a, inset 0 1px 1px rgba(255,255,255,.25); transition: transform .05s; }
+.pildora.on { transform: translateY(0.5vh); box-shadow: 0 0.1vh 0 #15171a; }
+.acciones { display: flex; gap: 2vh; }
+.chico { height: 7.5vh; padding: 0 2.6vh; border-radius: 99px; font: 700 2.6vh/1 -apple-system, sans-serif;
   display: flex; align-items: center; justify-content: center; white-space: nowrap; }
-#salir-juego { background: #8d1f19; box-shadow: 0 3px 0 #4d0d09; }
-#volver-control { background: #2a6fd6; border: 2px solid #9fdcff; box-shadow: 0 3px 0 #163f84; }
-#jugador { position: absolute; left: 50%; top: 15vh; transform: translateX(-50%); font-size: 2.6vh; color: #9fdcff; font-weight: 700; letter-spacing: 1px; }
+#volver-control { color: #3a3f47; background: linear-gradient(#fbfcfd, #cfd4da); box-shadow: 0 0.6vh 0 #8c939c, inset 0 1px 1px #fff; }
+#salir-juego { color: #fff; background: linear-gradient(#e0473e, #a5160f); box-shadow: 0 0.6vh 0 #5e0b07, inset 0 1px 1px rgba(255,255,255,.35); }
+.chico:active { transform: translateY(0.4vh); }
 #haptico { position: absolute; left: -9999px; }
 </style>
 </head>
@@ -144,30 +173,40 @@ body.en-mando #mando { display: block; }
 </main>
 
 <section id="mando">
-  <div id="girar"><b>↻</b>Gira el celular en horizontal para jugar<button class="chico" id="volver-control-v" style="background:#2a6fd6;margin-top:10px">📺 Volver al control</button></div>
-  <div id="jugador">Conectando…</div>
-  <div class="centro" id="fila-sup">
-    <button class="chico" id="volver-control">📺 Control</button>
-    <button class="chico" id="salir-juego">✕ Salir del juego</button>
-  </div>
+  <div id="girar"><b>📱</b>Gira el celular en horizontal para jugar
+    <button class="chico" id="volver-control-v" style="background:#2a6fd6;color:#fff;margin-top:6px">📺 Volver al control</button></div>
   <div class="gatillo mb" id="b-l" data-bit="4">L</div>
   <div class="gatillo mb" id="b-r" data-bit="5">R</div>
-  <div id="dpad">
-    <div class="brazo v"></div><div class="brazo h"></div>
-    <span class="marca-d" data-d="8" style="left:43%;top:4%">▲</span>
-    <span class="marca-d" data-d="9" style="left:43%;bottom:4%">▼</span>
-    <span class="marca-d" data-d="10" style="left:5%;top:39%">◀</span>
-    <span class="marca-d" data-d="11" style="right:5%;top:39%">▶</span>
-  </div>
-  <div class="rombo">
-    <div class="mb" id="b-x" data-bit="2">X</div>
-    <div class="mb" id="b-y" data-bit="3">Y</div>
-    <div class="mb" id="b-a" data-bit="1">A</div>
-    <div class="mb" id="b-b" data-bit="0">B</div>
-  </div>
-  <div class="centro" id="fila-sel">
-    <div class="pildora mb" data-bit="6">SELECT</div>
-    <div class="pildora mb" data-bit="7">START</div>
+  <div class="cuerpo">
+    <div class="pozo izq">
+      <div id="dpad">
+        <div class="brazo v"></div><div class="brazo h"></div><div class="cubo"></div>
+        <span class="marca-d" data-d="8" style="left:50%;top:7%;transform:translateX(-50%)">▲</span>
+        <span class="marca-d" data-d="9" style="left:50%;bottom:7%;transform:translateX(-50%)">▼</span>
+        <span class="marca-d" data-d="10" style="left:7%;top:50%;transform:translateY(-50%)">◀</span>
+        <span class="marca-d" data-d="11" style="right:7%;top:50%;transform:translateY(-50%)">▶</span>
+      </div>
+    </div>
+    <div class="medio">
+      <div class="marca-m">MIRAY</div>
+      <div id="jugador">Conectando…</div>
+      <div class="selstart">
+        <div class="ss"><div class="ranura"><div class="pildora mb" data-bit="6"></div></div>SELECT</div>
+        <div class="ss"><div class="ranura"><div class="pildora mb" data-bit="7"></div></div>START</div>
+      </div>
+      <div class="acciones">
+        <button class="chico" id="volver-control">📺 Control</button>
+        <button class="chico" id="salir-juego">✕ Salir del juego</button>
+      </div>
+    </div>
+    <div class="pozo der">
+      <div class="rombo">
+        <div class="mb" id="b-x" data-bit="2">X</div>
+        <div class="mb" id="b-y" data-bit="3">Y</div>
+        <div class="mb" id="b-a" data-bit="1">A</div>
+        <div class="mb" id="b-b" data-bit="0">B</div>
+      </div>
+    </div>
   </div>
 </section>
 <label id="haptico"><input type="checkbox" switch id="haptico-in"></label>
@@ -233,9 +272,30 @@ document.querySelectorAll("[data-o]").forEach(b => {
   b.addEventListener("contextmenu", ev => ev.preventDefault());
 });
 
+/* --- sin zoom: Safari del iPhone ignora user-scalable=no, así que se cancelan aquí el doble toque y el
+   pellizco (en el modo mando, todos los toques: ahí solo cuentan los eventos "pointer") --- */
+let ultimoToque = 0;
+document.addEventListener("touchstart", ev => {
+  if (enMando || ev.touches.length > 1) ev.preventDefault();
+}, { passive: false });
+document.addEventListener("touchend", ev => {
+  const t = Date.now();
+  if (enMando || t - ultimoToque < 400) ev.preventDefault();
+  ultimoToque = t;
+}, { passive: false });
+["gesturestart", "gesturechange", "gestureend", "dblclick"].forEach(t =>
+  document.addEventListener(t, ev => ev.preventDefault(), { passive: false }));
+function quitarZoom() {          // si ya quedó agrandado, volver al tamaño normal
+  const m = document.querySelector('meta[name="viewport"]');
+  const c = m.content;
+  m.content = c.replace("maximum-scale=1", "maximum-scale=1.01");
+  requestAnimationFrame(() => { m.content = c; });
+}
+
 /* --- modo mando --- */
 function entrarMando() {
   enMando = true; mascara = 0;
+  quitarZoom();
   document.body.classList.add("en-mando");
   $("#jugador").textContent = "Conectando…";
   mandar("m:on");
@@ -249,7 +309,7 @@ function salirMando() {
   document.body.classList.remove("en-mando");
   if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
 }
-$("#ir-mando").addEventListener("click", entrarMando);
+$("#ir-mando").addEventListener("pointerdown", ev => { ev.preventDefault(); vibrar(12); entrarMando(); });
 ["#volver-control", "#volver-control-v"].forEach(s => $(s).addEventListener("pointerdown", ev => { ev.preventDefault(); vibrar(12); salirMando(); }));
 $("#salir-juego").addEventListener("pointerdown", ev => { ev.preventDefault(); vibrar(20); mandar("o:stop"); });
 
