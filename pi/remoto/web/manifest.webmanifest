@@ -1,6 +1,6 @@
 {
-  "name": "MIRAY · Control de la Mini TV",
-  "short_name": "MIRAY",
+  "name": "Paolo TV · Control remoto",
+  "short_name": "Paolo TV",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

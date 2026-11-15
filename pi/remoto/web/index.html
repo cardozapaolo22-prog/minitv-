@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>MIRAY</title>
+<title>Paolo TV</title>
 <meta name="theme-color" content="#16181c">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="MIRAY">
+<meta name="apple-mobile-web-app-title" content="Paolo TV">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icono-192.png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -30,7 +30,7 @@ button { font: inherit; color: inherit; border: 0; padding: 0; cursor: pointer; 
   background: linear-gradient(100deg, var(--plata2) 0%, var(--plata1) 22%, #dfe3e8 48%, var(--plata1) 70%, var(--plata3) 100%);
   box-shadow: inset 0 2px 1px #fff, inset 0 -3px 6px rgba(0,0,0,.25), 0 18px 40px rgba(0,0,0,.6); }
 .fila { display: flex; justify-content: space-between; align-items: center; gap: 14px; }
-.marca { font-weight: 900; font-size: 26px; letter-spacing: 5px; color: #4a5059;
+.marca { font-weight: 900; font-size: 24px; letter-spacing: 3px; white-space: nowrap; color: #4a5059;
   text-shadow: 0 1px 0 #fff, 0 -1px 0 rgba(0,0,0,.25); padding-left: 6px; }
 .btn { border-radius: 999px; transition: transform .06s, filter .06s; }
 .btn.apretado { transform: scale(.94); filter: brightness(.88); }
@@ -120,7 +120,7 @@ body.en-mando #mando { display: block; }
 
 .medio { position: absolute; top: 0; bottom: 0; left: calc(4vh + min(66vh, 34vw)); right: calc(4vh + min(66vh, 34vw));
   display: flex; flex-direction: column; align-items: center; justify-content: space-evenly; padding: 3vh 0; }
-.marca-m { font: 900 5.4vh/1 -apple-system, sans-serif; letter-spacing: 1.1vh; color: #4a5059; text-shadow: 0 1px 0 #fff, 0 -1px 0 rgba(0,0,0,.25); }
+.marca-m { font: 900 5.4vh/1 -apple-system, sans-serif; letter-spacing: 0.6vh; color: #4a5059; white-space: nowrap; text-shadow: 0 1px 0 #fff, 0 -1px 0 rgba(0,0,0,.25); }
 #jugador { background: #0d1a14; color: #7dffb2; border-radius: 1.2vh; padding: 1vh 2.4vh; font: 700 3.2vh/1.2 ui-monospace, Menlo, monospace;
   box-shadow: inset 0 0.4vh 1vh rgba(0,0,0,.8), 0 1px 0 #fff; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .selstart { display: flex; gap: 4vh; }
@@ -143,7 +143,7 @@ body.en-mando #mando { display: block; }
 
 <main id="control">
   <div class="fila">
-    <div class="marca">MIRAY</div>
+    <div class="marca">PAOLO TV</div>
     <button id="encendido" class="btn" data-o="encendido" aria-label="Encender o apagar">⏻</button>
   </div>
   <div id="pantallita">Buscando la TV…</div>
@@ -188,7 +188,7 @@ body.en-mando #mando { display: block; }
       </div>
     </div>
     <div class="medio">
-      <div class="marca-m">MIRAY</div>
+      <div class="marca-m">PAOLO TV</div>
       <div id="jugador">Conectando…</div>
       <div class="selstart">
         <div class="ss"><div class="ranura"><div class="pildora mb" data-bit="6"></div></div>SELECT</div>

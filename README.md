@@ -12,7 +12,7 @@ Menú propio (`pi/minitv`, Python + Pillow): **TV** (canales con episodios al az
 
 ## Control remoto en el celular
 
-Un control plateado estilo años 2000 ("MIRAY") que se abre en el navegador del teléfono. No usa
+Un control plateado estilo años 2000 ("Paolo TV") que se abre en el navegador del teléfono. No usa
 internet: la página la sirve la propia TV.
 
 | Botón | En el menú | Viendo un episodio / canal | Jugando |
