@@ -1327,7 +1327,12 @@ class Menu:
             ip = ip[ip.index("inet") + 1].split("/")[0] if "inet" in ip else ""
         except (OSError, subprocess.SubprocessError, ValueError, IndexError):
             ip = ""
-        datos = (modo, conf["SSID"], conf["CLAVE"], ip or (conf["IP"] if modo == "propia" else ""))
+        try:                                                 # PIN de Administrar (lo crea minitv-remoto)
+            with open(os.path.expanduser("~/.config/minitv/admin.json"), encoding="utf-8") as f:
+                pin = str(json.load(f).get("pin", ""))
+        except (OSError, ValueError):
+            pin = ""
+        datos = (modo, conf["SSID"], conf["CLAVE"], ip or (conf["IP"] if modo == "propia" else ""), pin)
         self._red_cache = (ahora(), datos)
         return datos
 
@@ -1343,7 +1348,7 @@ class Menu:
         return im.resize((im.width * k, im.height * k), Image.NEAREST)
 
     def _panel_remoto(self, img, d):
-        modo, ssid, clave, ip = self._red()
+        modo, ssid, clave, ip, pin = self._red()
         d.rectangle((0, 30, W, H), fill=FONDO)
         d.text((14, 36), "Control remoto", font=self.f_sel, fill=BLANCO)
         url = f"http://{ip}" if ip else "http://minitv.local"
@@ -1357,7 +1362,9 @@ class Menu:
                 tw = d.textsize(titulo, font=self.f_sub)[0]
                 d.text((x + (140 - tw) // 2, 62), titulo, font=self.f_sub, fill=CELESTE)
             lineas = [(f"Red «{ssid}»  ·  clave: {clave}", BLANCO), (f"Control: {url}  o  http://minitv.local", GRIS_AZUL)]
-            y = 190
+            if pin:
+                lineas.append((f"PIN para Administrar: {pin}", CELESTE))
+            y = 186 if pin else 190
         else:
             qr = self._qr(url, 120)
             img.paste(qr, (14, 64))
@@ -1366,6 +1373,8 @@ class Menu:
                       ("http://minitv.local", BLANCO), (url if ip else "", GRIS_AZUL), ("", BLANCO),
                       ("Sin el wifi de casa, la TV", GRIS_AZUL), (f"crea su red «{ssid}»", GRIS_AZUL),
                       (f"clave: {clave}", BLANCO)]
+            if pin:
+                lineas.append((f"PIN Administrar: {pin}", CELESTE))
             for i, (t, color) in enumerate(lineas):
                 d.text((x, 66 + i * 15), recortar(d, t, self.f_sub, W - x - 8), font=self.f_sub, fill=color)
             lineas, y = [], 0

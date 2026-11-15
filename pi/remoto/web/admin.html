@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Paolo TV · Administrar</title>
+<meta name="theme-color" content="#16181c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="icon" href="icono-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+:root { --fondo: #16181c; --tarjeta: #22262c; --tarjeta2: #2b3038; --linea: #363c45; --texto: #e9edf2; --suave: #9aa3ad;
+  --azul: #2a6fd6; --azul-borde: #9fdcff; --rojo: #d9231a; --verde: #39d17b; --amarillo: #e8b400; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; background: var(--fondo); color: var(--texto); font: 16px/1.4 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+body { padding: calc(env(safe-area-inset-top) + 8px) 14px calc(env(safe-area-inset-bottom) + 30px); max-width: 720px; margin: 0 auto; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; border: 0; border-radius: 12px; padding: 11px 16px; font-weight: 700; background: var(--tarjeta2); }
+button:active { transform: translateY(1px); filter: brightness(.9); }
+button.azul { background: var(--azul); color: #fff; box-shadow: inset 0 0 0 2px var(--azul-borde); }
+button.rojo { background: #8d1f19; color: #fff; }
+button.chico { padding: 7px 11px; font-size: 14px; border-radius: 10px; }
+button:disabled { opacity: .45; }
+input[type=text], input[type=password], input[type=tel], select { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid var(--linea); background: #15181c; }
+label.archivo { display: block; text-align: center; padding: 16px; border: 2px dashed var(--linea); border-radius: 14px; color: var(--suave); cursor: pointer; }
+label.archivo input { display: none; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.marca { font-weight: 900; letter-spacing: 3px; font-size: 20px; color: #cfd4da; }
+.marca small { display: block; letter-spacing: 1px; font-size: 12px; color: var(--suave); font-weight: 700; }
+a.volver { color: var(--azul-borde); text-decoration: none; font-weight: 700; white-space: nowrap; }
+nav { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; position: sticky; top: env(safe-area-inset-top); z-index: 5;
+  background: var(--fondo); padding: 6px 0 10px; }
+nav button { padding: 10px 4px; font-size: 14px; background: var(--tarjeta); color: var(--suave); }
+nav button.activa { background: var(--azul); color: #fff; }
+.tarjeta { background: var(--tarjeta); border-radius: 16px; padding: 14px; margin-bottom: 12px; }
+.tarjeta h2 { margin: 0 0 10px; font-size: 17px; }
+.fila { display: flex; align-items: center; gap: 10px; }
+.fila > .crece { flex: 1; min-width: 0; }
+.pila > * + * { margin-top: 10px; }
+.suave { color: var(--suave); font-size: 14px; }
+.barra { height: 8px; border-radius: 4px; background: #111; overflow: hidden; margin-top: 6px; }
+.barra i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--verde), var(--azul-borde)); transition: width .3s; }
+.item { padding: 10px 0; border-top: 1px solid var(--linea); }
+.item:first-child { border-top: 0; }
+.titulo { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+details > summary { list-style: none; cursor: pointer; }
+details > summary::-webkit-details-marker { display: none; }
+details > summary .flecha { transition: transform .15s; color: var(--suave); }
+details[open] > summary .flecha { transform: rotate(90deg); }
+.portada { width: 40px; height: 44px; border-radius: 6px; object-fit: cover; background: #111; flex: none; }
+.logo { width: 76px; height: 40px; object-fit: contain; background: #0f1114; border-radius: 8px; flex: none; }
+.siglas { width: 76px; height: 40px; border-radius: 8px; border: 2px solid var(--suave); display: flex; align-items: center; justify-content: center; font-weight: 800; flex: none; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 7px 11px; border-radius: 999px; background: var(--tarjeta2); font-size: 14px; }
+.chip input { margin: 0; }
+.ok { color: var(--verde); } .error { color: #ff7d74; } .pausa { color: var(--amarillo); }
+#toast { position: fixed; left: 14px; right: 14px; bottom: calc(env(safe-area-inset-bottom) + 14px); z-index: 30; padding: 14px 16px;
+  border-radius: 14px; background: #2b3038; box-shadow: 0 8px 24px rgba(0,0,0,.5); font-weight: 600; display: none; text-align: center; }
+#toast.visible { display: block; } #toast.mal { background: #8d1f19; }
+
+/* PIN */
+#entrar { max-width: 340px; margin: 30px auto 0; text-align: center; }
+#puntos { display: flex; justify-content: center; gap: 16px; margin: 18px 0 8px; }
+#puntos i { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--suave); }
+#puntos i.lleno { background: var(--azul-borde); border-color: var(--azul-borde); }
+#teclado { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+#teclado button { height: 64px; font-size: 26px; border-radius: 50%; width: 64px; justify-self: center; background: linear-gradient(#fbfcfd, #cfd4da); color: #3a3f47; box-shadow: 0 3px 0 #8c939c; }
+#pin-error { min-height: 22px; color: #ff7d74; font-weight: 600; }
+.oculto { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="marca">PAOLO TV<small>Administrar</small></div>
+  <a class="volver" href="/">← Control</a>
+</header>
+
+<section id="entrar">
+  <h2 style="margin:0">Escribe el PIN</h2>
+  <div class="suave">Aparece en la TV: <b>Ajustes → Control remoto</b></div>
+  <div id="puntos"><i></i><i></i><i></i><i></i></div>
+  <div id="pin-error"></div>
+  <div id="teclado"></div>
+</section>
+
+<main id="app" class="oculto">
+  <nav>
+    <button data-tab="videos" class="activa">📺 Videos</button>
+    <button data-tab="juegos">🎮 Juegos</button>
+    <button data-tab="canales">📡 Canales</button>
+    <button data-tab="ajustes">⚙️ Ajustes</button>
+  </nav>
+
+  <!-- ===== VIDEOS ===== -->
+  <section data-panel="videos">
+    <div class="tarjeta">
+      <div class="fila"><div class="crece"><b>Espacio libre</b> <span id="espacio" class="suave"></span></div></div>
+      <div class="barra"><i id="espacio-barra"></i></div>
+    </div>
+    <div class="tarjeta pila">
+      <h2>➕ Añadir episodios</h2>
+      <select id="v-serie"></select>
+      <input id="v-nueva" type="text" class="oculto" placeholder="Nombre de la serie nueva (ej.: Bob Esponja)">
+      <label class="archivo">📁 Elegir videos<br><span class="suave">del celular o la computadora</span><input id="v-archivos" type="file" accept="video/*,.mkv,.avi,.wmv,.mpg" multiple></label>
+      <div class="suave">Se suben a la TV y ella los convierte sola al tamaño de su pantalla (tarda más o menos lo que dura cada video). Puedes cerrar esta página cuando terminen de <b>subir</b>.</div>
+      <div id="v-subidas"></div>
+    </div>
+    <div class="tarjeta" id="cola-tarjeta">
+      <h2>⏳ Convirtiendo en la TV</h2>
+      <div id="cola"></div>
+    </div>
+    <div class="tarjeta">
+      <h2>📚 Series en la TV</h2>
+      <div id="series"></div>
+    </div>
+  </section>
+
+  <!-- ===== JUEGOS ===== -->
+  <section data-panel="juegos" class="oculto">
+    <div class="tarjeta pila">
+      <h2>➕ Añadir juegos</h2>
+      <select id="j-consola"><option value="">Detectar la consola sola</option></select>
+      <label class="archivo">📁 Elegir juegos<br><span class="suave">.gb .gbc .gba .nes .sfc .md .bin .cue .chd .pbp .zip</span><input id="j-archivos" type="file" multiple></label>
+      <div class="suave">La portada se busca sola si la TV tiene internet. PlayStation: sube juntos el .cue y sus .bin (o mejor un .chd o .pbp).</div>
+      <div id="j-subidas"></div>
+    </div>
+    <div class="tarjeta">
+      <h2>🕹️ Juegos en la TV</h2>
+      <div id="juegos"></div>
+    </div>
+  </section>
+
+  <!-- ===== CANALES ===== -->
+  <section data-panel="canales" class="oculto">
+    <div class="tarjeta suave">Cada canal pasa al azar los episodios de sus series, con su logo (la «mosca») en una esquina. «Todo» siempre mezcla todas las series.</div>
+    <div id="canales"></div>
+    <div class="fila" style="gap:10px">
+      <button id="canal-nuevo" class="crece">➕ Canal nuevo</button>
+      <button id="canales-guardar" class="azul crece">💾 Guardar canales</button>
+    </div>
+  </section>
+
+  <!-- ===== AJUSTES ===== -->
+  <section data-panel="ajustes" class="oculto">
+    <div class="tarjeta pila">
+      <h2>📶 Wifi de casa</h2>
+      <div class="suave" id="wifi-modo"></div>
+      <div id="wifi-redes"></div>
+      <input id="wifi-ssid" type="text" placeholder="Nombre de la red (como aparece en el celular)" autocapitalize="off" autocorrect="off">
+      <input id="wifi-clave" type="password" placeholder="Clave del wifi">
+      <button id="wifi-agregar" class="azul">Guardar esta red</button>
+      <div class="suave">Si no encuentra ninguna red guardada al encenderse, la TV crea su propia red «MiniTV».</div>
+    </div>
+    <div class="tarjeta pila">
+      <h2>🔒 PIN de Administrar</h2>
+      <input id="pin-nuevo" type="tel" inputmode="numeric" maxlength="4" placeholder="PIN nuevo (4 números)">
+      <button id="pin-cambiar">Cambiar el PIN</button>
+    </div>
+    <button id="salir" class="rojo" style="width:100%">Salir de Administrar</button>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+const esc = t => String(t).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+let datos = null, canales = [], seriesNombres = [];
+
+function aviso(texto, mal) {
+  const t = $("#toast"); t.textContent = texto; t.className = "visible" + (mal ? " mal" : "");
+  clearTimeout(aviso.t); aviso.t = setTimeout(() => t.className = "", mal ? 5000 : 2600);
+}
+async function api(ruta, opciones = {}) {
+  const r = await fetch(ruta, { credentials: "same-origin", ...opciones,
+    headers: opciones.body && typeof opciones.body === "string" ? { "Content-Type": "application/json" } : undefined });
+  let d = {}; try { d = await r.json(); } catch (e) {}
+  if (r.status === 401) { mostrarPin(); throw new Error(d.error || "Escribe el PIN"); }
+  if (!r.ok || d.ok === false) throw new Error(d.error || "No se pudo");
+  return d;
+}
+const post = (ruta, cuerpo) => api(ruta, { method: "POST", body: JSON.stringify(cuerpo) });
+
+/* ---------- PIN ---------- */
+let pin = "";
+function pintarPuntos() { $$("#puntos i").forEach((p, i) => p.classList.toggle("lleno", i < pin.length)); }
+["1","2","3","4","5","6","7","8","9","","0","⌫"].forEach(k => {
+  const b = document.createElement("button"); b.textContent = k;
+  if (!k) b.style.visibility = "hidden";
+  b.addEventListener("click", async () => {
+    if (k === "⌫") pin = pin.slice(0, -1); else if (pin.length < 4) pin += k;
+    pintarPuntos(); $("#pin-error").textContent = "";
+    if (pin.length === 4) {
+      try { await post("/api/entrar", { pin }); pin = ""; pintarPuntos(); empezar(); }
+      catch (e) { $("#pin-error").textContent = e.message; pin = ""; setTimeout(pintarPuntos, 250); if (navigator.vibrate) navigator.vibrate([40, 40, 40]); }
+    }
+  });
+  $("#teclado").appendChild(b);
+});
+function mostrarPin() { $("#entrar").classList.remove("oculto"); $("#app").classList.add("oculto"); }
+async function empezar() {
+  $("#entrar").classList.add("oculto"); $("#app").classList.remove("oculto");
+  await cargar(); cargarCanales(); cargarWifi();
+}
+
+/* ---------- pestañas ---------- */
+$$("nav button").forEach(b => b.addEventListener("click", () => {
+  $$("nav button").forEach(x => x.classList.toggle("activa", x === b));
+  $$("[data-panel]").forEach(p => p.classList.toggle("oculto", p.dataset.panel !== b.dataset.tab));
+  if (b.dataset.tab === "canales") cargarCanales();
+  if (b.dataset.tab === "ajustes") cargarWifi();
+}));
+
+/* ---------- resumen: videos y juegos ---------- */
+async function cargar() {
+  try { datos = await api("/api/resumen"); } catch (e) { return; }
+  $("#espacio").textContent = `${datos.libre_gb} GB de ${datos.total_gb} GB`;
+  $("#espacio-barra").style.width = Math.round(100 * (1 - datos.libre_gb / datos.total_gb)) + "%";
+  // selector de serie (conserva la elección)
+  const sel = $("#v-serie"), antes = sel.value;
+  sel.innerHTML = `<option value="">— Elige la serie —</option>` +
+    datos.series.map(s => `<option value="${esc(s.id)}">${esc(s.nombre)}</option>`).join("") +
+    `<option value="__nueva">➕ Serie nueva…</option>`;
+  if ([...sel.options].some(o => o.value === antes)) sel.value = antes;
+  pintarCola(); pintarSeries(); pintarJuegos();
+}
+function pintarCola() {
+  const cola = datos.cola || [];
+  $("#cola-tarjeta").classList.toggle("oculto", !cola.length);
+  $("#cola").innerHTML = cola.map(t => {
+    const serie = (datos.series.find(s => s.id === t.serie) || { nombre: t.serie.replace(/^\d+\s+/, "") }).nombre;
+    let estado = t.estado === "esperando" ? `<span class="suave">En espera</span>`
+      : t.estado === "convirtiendo" ? (t.pausa ? `<span class="pausa">En pausa: alguien está jugando</span>` : `Convirtiendo ${t.progreso}%`)
+      : t.estado === "listo" ? `<span class="ok">✓ Ya está en la TV</span>`
+      : t.estado === "cancelando" ? `<span class="suave">Cancelando…</span>`
+      : `<span class="error">✕ ${esc(t.error || "Error")}</span>`;
+    const quitar = t.estado === "listo" ? "" : `<button class="chico" data-cancelar="${t.id}">${t.estado === "error" ? "Quitar" : "Cancelar"}</button>`;
+    return `<div class="item"><div class="fila"><div class="crece"><div class="titulo">${esc(t.nombre)}</div>
+      <div class="suave">${esc(serie)} · ${estado}</div>
+      ${t.estado === "convirtiendo" ? `<div class="barra"><i style="width:${t.progreso}%"></i></div>` : ""}</div>${quitar}</div></div>`;
+  }).join("");
+  $$("[data-cancelar]").forEach(b => b.onclick = async () => {
+    if (!confirm("¿Cancelar este video? Habrá que subirlo de nuevo.")) return;
+    try { await post("/api/borrar", { tipo: "tarea", id: b.dataset.cancelar }); cargar(); } catch (e) { aviso(e.message, true); }
+  });
+}
+function pintarSeries() {
+  $("#series").innerHTML = datos.series.length ? datos.series.map(s => `
+    <details class="item"><summary class="fila"><span class="flecha">▶</span><div class="crece"><div class="titulo">${esc(s.nombre)}</div>
+      <div class="suave">${s.episodios.length} episodios · ${s.mb >= 1000 ? (s.mb / 1000).toFixed(1) + " GB" : s.mb + " MB"}</div></div></summary>
+      <div style="padding:6px 0 0 22px">
+        ${s.episodios.map(e => `<div class="fila item"><div class="crece titulo" style="font-weight:500">${esc(e.archivo.replace(/\.[^.]+$/, ""))}</div>
+          <button class="chico" data-borrar-ep="${esc(e.archivo)}" data-serie="${esc(s.id)}">🗑</button></div>`).join("")}
+        <button class="rojo chico" style="margin-top:8px" data-borrar-serie="${esc(s.id)}" data-nombre="${esc(s.nombre)}">🗑 Borrar toda la serie</button>
+      </div></details>`).join("") : `<div class="suave">Todavía no hay series.</div>`;
+  $$("[data-borrar-ep]").forEach(b => b.onclick = async () => {
+    if (!confirm(`¿Borrar «${b.dataset.borrarEp}» de la TV?`)) return;
+    try { await post("/api/borrar", { tipo: "episodio", serie: b.dataset.serie, archivo: b.dataset.borrarEp }); aviso("Episodio borrado"); cargar(); }
+    catch (e) { aviso(e.message, true); }
+  });
+  $$("[data-borrar-serie]").forEach(b => b.onclick = async () => {
+    if (!confirm(`¿Borrar la serie «${b.dataset.nombre}» completa, con todos sus episodios?`)) return;
+    if (!confirm("Seguro? No se puede deshacer.")) return;
+    try { await post("/api/borrar", { tipo: "serie", serie: b.dataset.borrarSerie }); aviso("Serie borrada"); cargar(); }
+    catch (e) { aviso(e.message, true); }
+  });
+}
+function pintarJuegos() {
+  const sel = $("#j-consola");
+  if (sel.options.length === 1) datos.consolas.forEach(c => sel.add(new Option(c.nombre, c.id)));
+  const con = datos.consolas.filter(c => c.juegos.length);
+  $("#juegos").innerHTML = con.length ? con.map(c => `
+    <details class="item"><summary class="fila"><span class="flecha">▶</span><div class="crece"><div class="titulo">${esc(c.nombre)}</div>
+      <div class="suave">${c.juegos.length} juegos</div></div></summary>
+      <div style="padding:6px 0 0 22px">${c.juegos.map(j => `<div class="fila item">
+        ${j.portada ? `<img class="portada" loading="lazy" src="/api/portada?consola=${c.id}&archivo=${encodeURIComponent(j.archivo)}">` : `<div class="portada"></div>`}
+        <div class="crece"><div class="titulo">${esc(j.titulo)}</div><div class="suave titulo">${esc(j.archivo)}</div></div>
+        <button class="chico" data-borrar-juego="${esc(j.archivo)}" data-consola="${c.id}" data-titulo="${esc(j.titulo)}">🗑</button></div>`).join("")}</div>
+    </details>`).join("") : `<div class="suave">Todavía no hay juegos.</div>`;
+  $$("[data-borrar-juego]").forEach(b => b.onclick = async () => {
+    if (!confirm(`¿Borrar «${b.dataset.titulo}» de la TV? (las partidas guardadas se conservan)`)) return;
+    try { await post("/api/borrar", { tipo: "juego", consola: b.dataset.consola, archivo: b.dataset.borrarJuego }); aviso("Juego borrado"); cargar(); }
+    catch (e) { aviso(e.message, true); }
+  });
+}
+$("#v-serie").addEventListener("change", () => $("#v-nueva").classList.toggle("oculto", $("#v-serie").value !== "__nueva"));
+
+/* ---------- subidas (de a una, con barra de progreso) ---------- */
+const colaSubidas = [];
+let subiendo = false;
+function subir(url, archivo, fila) {
+  return new Promise((ok, mal) => {
+    const x = new XMLHttpRequest();
+    x.open("PUT", url);
+    x.upload.onprogress = ev => { if (ev.lengthComputable) {
+      const p = Math.round(100 * ev.loaded / ev.total);
+      fila.querySelector("i").style.width = p + "%";
+      fila.querySelector(".estado").textContent = `Subiendo ${p}% · ${(ev.loaded / 1e6).toFixed(0)} de ${(ev.total / 1e6).toFixed(0)} MB`;
+    } };
+    x.onload = () => { let d = {}; try { d = JSON.parse(x.responseText); } catch (e) {}
+      if (x.status === 401) { mostrarPin(); }
+      x.status === 200 && d.ok ? ok(d) : mal(new Error(d.error || "No se pudo subir")); };
+    x.onerror = () => mal(new Error("Se cortó la conexión con la TV"));
+    x.send(archivo);
+  });
+}
+async function siguienteSubida() {
+  if (subiendo || !colaSubidas.length) return;
+  subiendo = true;
+  const { url, archivo, fila, alTerminar } = colaSubidas.shift();
+  try { const d = await subir(url, archivo, fila); fila.querySelector(".estado").innerHTML = `<span class="ok">${alTerminar(d)}</span>`; fila.querySelector("i").style.width = "100%"; }
+  catch (e) { fila.querySelector(".estado").innerHTML = `<span class="error">✕ ${esc(e.message)}</span>`; }
+  subiendo = false; cargar(); siguienteSubida();
+}
+function filaSubida(contenedor, nombre) {
+  const f = document.createElement("div"); f.className = "item";
+  f.innerHTML = `<div class="titulo">${esc(nombre)}</div><div class="suave estado">En espera…</div><div class="barra"><i></i></div>`;
+  contenedor.appendChild(f); return f;
+}
+$("#v-archivos").addEventListener("change", ev => {
+  const archivos = [...ev.target.files]; ev.target.value = "";
+  const serie = $("#v-serie").value, nueva = $("#v-nueva").value.trim();
+  if (!serie) { aviso("Primero elige la serie", true); return; }
+  if (serie === "__nueva" && !nueva) { aviso("Escribe el nombre de la serie nueva", true); $("#v-nueva").focus(); return; }
+  archivos.forEach(a => {
+    const q = serie === "__nueva" ? `nueva=${encodeURIComponent(nueva)}` : `serie=${encodeURIComponent(serie)}`;
+    colaSubidas.push({ url: `/api/subir/video?${q}&archivo=${encodeURIComponent(a.name)}`, archivo: a,
+      fila: filaSubida($("#v-subidas"), a.name), alTerminar: () => "✓ Subido: la TV lo está convirtiendo" });
+  });
+  siguienteSubida();
+});
+$("#j-archivos").addEventListener("change", ev => {
+  const archivos = [...ev.target.files]; ev.target.value = "";
+  const consola = $("#j-consola").value;
+  // PlayStation: primero los .bin, al final el .cue
+  archivos.sort((a, b) => (a.name.toLowerCase().endsWith(".cue")) - (b.name.toLowerCase().endsWith(".cue")));
+  archivos.forEach(a => {
+    const bin = a.name.toLowerCase().endsWith(".bin");
+    const c = consola || (bin && archivos.some(x => x.name.toLowerCase().endsWith(".cue")) ? "psx" : "");
+    colaSubidas.push({ url: `/api/subir/juego?archivo=${encodeURIComponent(a.name)}${c ? "&consola=" + c : ""}`, archivo: a,
+      fila: filaSubida($("#j-subidas"), a.name), alTerminar: d => `✓ Listo en ${esc(d.nombre_consola)}` });
+  });
+  siguienteSubida();
+});
+
+/* ---------- canales ---------- */
+async function cargarCanales() {
+  try { const d = await api("/api/canales"); canales = d.canales; seriesNombres = d.series; pintarCanales(); } catch (e) {}
+}
+function siglas(n) { const p = n.trim().split(/\s+/); return (p.length === 1 && n.length <= 4 ? n : p.map(x => x[0]).join("")).toUpperCase().slice(0, 3); }
+function pintarCanales() {
+  $("#canales").innerHTML = canales.map((c, i) => `
+    <div class="tarjeta pila" data-i="${i}">
+      <div class="fila">
+        ${c.logo ? `<img class="logo" src="/api/logo?canal=${encodeURIComponent(c.nombre)}&t=${Date.now()}">` : `<div class="siglas">${esc(siglas(c.nombre || "?"))}</div>`}
+        <input class="crece" type="text" data-campo="nombre" value="${esc(c.nombre)}" placeholder="Nombre del canal">
+      </div>
+      <div class="chips">${seriesNombres.map(s => `<label class="chip"><input type="checkbox" data-serie="${esc(s)}" ${c.series.some(x => x.toLowerCase() === s.toLowerCase()) ? "checked" : ""}>${esc(s)}</label>`).join("")}</div>
+      <div class="fila">
+        <select class="crece" data-campo="mosca"><option value="derecha">Logo abajo a la derecha</option><option value="izquierda" ${c.mosca === "izquierda" ? "selected" : ""}>Logo abajo a la izquierda</option></select>
+      </div>
+      <div class="fila">
+        <label class="chip" style="cursor:pointer">🖼️ ${c.logo ? "Cambiar logo" : "Poner logo"}<input type="file" accept="image/*" data-logo style="display:none"></label>
+        <span class="crece"></span>
+        <button class="chico rojo" data-quitar>Quitar canal</button>
+      </div>
+    </div>`).join("") || `<div class="tarjeta suave">No hay canales todavía.</div>`;
+  $$("#canales [data-i]").forEach(t => {
+    const c = canales[+t.dataset.i];
+    t.querySelector('[data-campo="nombre"]').oninput = ev => c.nombre = ev.target.value;
+    t.querySelector('[data-campo="mosca"]').onchange = ev => c.mosca = ev.target.value;
+    t.querySelectorAll("[data-serie]").forEach(x => x.onchange = () => {
+      c.series = c.series.filter(s => s.toLowerCase() !== x.dataset.serie.toLowerCase());
+      if (x.checked) c.series.push(x.dataset.serie);
+    });
+    t.querySelector("[data-quitar]").onclick = () => { if (confirm(`¿Quitar el canal «${c.nombre}»? (las series no se borran)`)) { canales.splice(+t.dataset.i, 1); pintarCanales(); } };
+    t.querySelector("[data-logo]").onchange = async ev => {
+      const f = ev.target.files[0]; if (!f) return;
+      if (!c.nombre.trim()) { aviso("Primero escribe el nombre del canal", true); return; }
+      try { await guardarCanales(true); await api(`/api/logo?canal=${encodeURIComponent(c.nombre.trim())}`, { method: "PUT", body: f });
+        aviso("Logo guardado"); cargarCanales(); } catch (e) { aviso(e.message, true); }
+    };
+  });
+}
+async function guardarCanales(silencio) {
+  const d = await post("/api/canales", { canales });
+  canales = d.canales; seriesNombres = d.series;
+  if (!silencio) { aviso("Canales guardados: se ven al volver al menú de la TV"); pintarCanales(); }
+}
+$("#canal-nuevo").onclick = () => { canales.push({ nombre: "", series: [], mosca: "derecha", logo: false }); pintarCanales();
+  const ins = $$('#canales [data-campo="nombre"]'); ins[ins.length - 1].focus(); };
+$("#canales-guardar").onclick = async () => { try { await guardarCanales(); } catch (e) { aviso(e.message, true); } };
+
+/* ---------- ajustes ---------- */
+async function cargarWifi() {
+  try {
+    const d = await api("/api/wifi");
+    $("#wifi-modo").textContent = d.modo === "propia" ? "Ahora la TV está usando su propia red «MiniTV»." : d.modo === "casa" ? "Ahora la TV está conectada al wifi de casa." : "";
+    $("#wifi-redes").innerHTML = d.redes.map(r => `<div class="fila item"><div class="crece titulo">📶 ${esc(r)}</div><button class="chico" data-olvidar="${esc(r)}">Olvidar</button></div>`).join("")
+      || `<div class="suave">No hay redes guardadas.</div>`;
+    $$("[data-olvidar]").forEach(b => b.onclick = async () => {
+      if (d.redes.length === 1 && !confirm("Es la única red guardada: la TV ya no se conectará a internet ni a esta red. ¿Seguro?")) return;
+      if (d.redes.length > 1 && !confirm(`¿Olvidar la red «${b.dataset.olvidar}»?`)) return;
+      try { await post("/api/wifi", { accion: "olvidar", ssid: b.dataset.olvidar }); aviso("Red olvidada"); cargarWifi(); } catch (e) { aviso(e.message, true); }
+    });
+  } catch (e) {}
+}
+$("#wifi-agregar").onclick = async () => {
+  try { await post("/api/wifi", { accion: "agregar", ssid: $("#wifi-ssid").value.trim(), clave: $("#wifi-clave").value });
+    $("#wifi-clave").value = ""; aviso("Red guardada"); cargarWifi(); } catch (e) { aviso(e.message, true); }
+};
+$("#pin-cambiar").onclick = async () => {
+  const n = $("#pin-nuevo").value.trim();
+  if (!/^\d{4}$/.test(n)) { aviso("El PIN debe tener 4 números", true); return; }
+  try { await post("/api/pin", { nuevo: n }); $("#pin-nuevo").value = ""; aviso("PIN cambiado"); } catch (e) { aviso(e.message, true); }
+};
+$("#salir").onclick = async () => { try { await post("/api/salir", {}); } catch (e) {} location.href = "/"; };
+
+/* ---------- inicio ---------- */
+setInterval(() => { if (datos && !$("#app").classList.contains("oculto") && (datos.cola || []).some(t => ["esperando", "convirtiendo", "cancelando"].includes(t.estado))) cargar(); }, 3000);
+api("/api/sesion").then(d => d.ok ? empezar() : mostrarPin()).catch(() => mostrarPin());
+</script>
+</body>
+</html>

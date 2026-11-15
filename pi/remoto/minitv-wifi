@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+"""minitv-wifi: redes wifi de casa de la Mini TV (lo usa la página Administrar, con sudo).
+
+  minitv-wifi lista                       nombres de las redes guardadas, una por línea
+  minitv-wifi agregar  < {"ssid", "clave"}  guarda la red (la clave se guarda cifrada, como PSK)
+  minitv-wifi olvidar  < {"ssid"}           la borra
+Edita /etc/wpa_supplicant/wpa_supplicant.conf (copia en .bak-minitv) y, si la TV está en la red de
+casa, le pide a wpa_supplicant que la relea. En la red propia ("MiniTV") se usa al reiniciar la TV.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+CONF = "/etc/wpa_supplicant/wpa_supplicant.conf"
+BLOQUE = re.compile(r"network=\{[^}]*\}\n?", re.S)
+
+
+def bloques(texto):
+    return [(m, re.search(r'^\s*ssid="(.*)"\s*$', m.group(0), re.M)) for m in BLOQUE.finditer(texto)]
+
+
+def quitar(texto, ssid):
+    for m, s in reversed(bloques(texto)):
+        if s and s.group(1) == ssid:
+            texto = texto[:m.start()] + texto[m.end():]
+    return texto
+
+
+def guardar(texto):
+    shutil.copy2(CONF, CONF + ".bak-minitv")
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(texto.rstrip("\n") + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONF)
+    try:
+        with open("/run/minitv-red/modo") as f:
+            en_casa = f.read().strip() != "propia"
+    except OSError:
+        en_casa = True
+    if en_casa:
+        subprocess.run(["/sbin/wpa_cli", "-i", "wlan0", "reconfigure"], capture_output=True, timeout=15)
+
+
+def main():
+    accion = sys.argv[1] if len(sys.argv) > 1 else ""
+    with open(CONF) as f:
+        texto = f.read()
+    if accion == "lista":
+        for _, s in bloques(texto):
+            if s:
+                print(s.group(1))
+        return 0
+    try:
+        d = json.load(sys.stdin)
+    except ValueError:
+        print("Datos inválidos", file=sys.stderr)
+        return 2
+    ssid = str(d.get("ssid", ""))
+    if not ssid or len(ssid) > 32 or any(c in ssid for c in '"\n\r'):
+        print("Nombre de red inválido", file=sys.stderr)
+        return 2
+    if accion == "agregar":
+        clave = str(d.get("clave", ""))
+        if not 8 <= len(clave) <= 63:
+            print("La clave debe tener de 8 a 63 caracteres", file=sys.stderr)
+            return 2
+        r = subprocess.run(["wpa_passphrase", ssid], input=clave + "\n", capture_output=True, text=True)
+        if r.returncode != 0 or "network={" not in r.stdout:
+            print(r.stdout.strip() or "No se pudo calcular la clave", file=sys.stderr)
+            return 1
+        bloque = "\n".join(l for l in r.stdout.splitlines() if not l.strip().startswith("#psk=")
+                           and not l.strip().startswith("# reading"))
+        texto = quitar(texto, ssid).rstrip("\n") + "\n\n" + bloque.strip() + "\n"
+        guardar(texto)
+        return 0
+    if accion == "olvidar":
+        guardar(quitar(texto, ssid))
+        return 0
+    print("Uso: minitv-wifi lista|agregar|olvidar", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

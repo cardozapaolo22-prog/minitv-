@@ -13,7 +13,9 @@ El teléfono habla con este servidor por un WebSocket (/ws), mensajes de texto c
   p:N       botones apretados del mando (máscara de bits, ver BITS)
 Cada teléfono en modo mando es un mando distinto: dos teléfonos = jugador 1 y jugador 2. RetroArch
 los reconoce con el perfil "MiniTV Mando.cfg" (autoconfig/udev).
-Solo biblioteca estándar de Python + python3-evdev.
+Administrar (http://minitv.local/admin.html, con PIN): subir, convertir y borrar videos y juegos,
+canales y logos, wifi de casa. Ver minitv_admin.py (/usr/local/lib/minitv).
+Solo biblioteca estándar de Python + python3-evdev (+ Pillow y ffmpeg para Administrar).
 """
 import base64
 import hashlib
@@ -24,6 +26,15 @@ import struct
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, "/usr/local/lib/minitv")
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import minitv_admin
+except ImportError as err:                                 # sin Administrar, el control sigue andando
+    minitv_admin = None
+    print(f"minitv-remoto: sin Administrar ({err})", flush=True)
+ADMIN = None
 
 WEB = "/usr/local/share/minitv/remoto"
 SOCK_CONTROL = "/run/minitv/control.sock"
@@ -181,8 +192,22 @@ class Manejador(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def do_POST(self):
+        self._api("POST")
+
+    def do_PUT(self):
+        self._api("PUT")
+
+    def _api(self, metodo):
+        if ADMIN and self.path.startswith("/api/"):
+            return ADMIN.atender(self, metodo)
+        self.close_connection = True
+        return self._responder(404, b"No existe", "text/plain; charset=utf-8")
+
     def do_GET(self):
         ruta = self.path.split("?", 1)[0]
+        if ruta.startswith("/api/") and ruta != "/api/estado":
+            return self._api("GET")
         if ruta == "/ws" and "websocket" in self.headers.get("Upgrade", "").lower():
             return self._websocket()
         if ruta == "/estado":
@@ -251,6 +276,9 @@ class Servidor(ThreadingHTTPServer):
 
 
 def main():
+    global ADMIN
+    if minitv_admin:
+        ADMIN = minitv_admin.Admin()
     srv = Servidor(("", PUERTO), Manejador)
     log(f"escuchando en el puerto {PUERTO}" + ("" if evdev else " (sin python3-evdev: no hay modo mando)"))
     try:
