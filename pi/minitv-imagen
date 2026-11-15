@@ -2,7 +2,13 @@
 # minitv-imagen: imagen de disco COMPACTA del sistema de la MiniTV, hecha en vivo (sin apagar la Pi ni
 # sacar la tarjeta), lista para grabar con Raspberry Pi Imager en otra tarjeta.
 #
-#   sudo minitv-imagen [CARPETA_DESTINO]        (por defecto /home/paolo/respaldo-imagen)
+#   sudo minitv-imagen [--limpia] [CARPETA_DESTINO]   (por defecto /home/paolo/respaldo-imagen)
+#
+# --limpia: imagen para armar OTRA MiniTV igual (minitv-limpia-FECHA.img.gz). Sin nada personal:
+#   sin estado ni partidas, sin redes wifi guardadas (arranca con su red propia "MiniTV" para
+#   configurarla desde el celular), sin Bluetooth emparejado, sin acceso SSH de esta Mac, sin
+#   historiales ni registros; clave del usuario paolo = "minitv" (pide cambiarla al entrar por SSH).
+#   En su primer arranque crea claves SSH nuevas, un PIN de Administrar y una clave nueva para su red.
 #
 # Cómo: crea un archivo de disco del tamaño justo (partición de arranque igual a la original + sistema
 # con lo ocupado y un 15 % de margen), con el MISMO identificador de disco (así /boot/cmdline.txt y
@@ -14,10 +20,13 @@
 # En la tarjeta nueva, el primer arranque agranda el sistema a toda la tarjeta (minitv-expandir).
 set -euo pipefail
 
+LIMPIA=no
+if [ "${1:-}" = "--limpia" ]; then LIMPIA=si; shift; fi
 DEST="${1:-/home/paolo/respaldo-imagen}"
 FECHA=$(date +%Y-%m-%d)
 DISCO=/dev/mmcblk0
-CRUDA="$DEST/minitv-sistema-$FECHA.img"
+NOMBRE=$([ "$LIMPIA" = si ] && echo minitv-limpia || echo minitv-sistema)
+CRUDA="$DEST/$NOMBRE-$FECHA.img"
 FINAL="$CRUDA.gz"
 MNT=/mnt/minitv-imagen
 LOOP=""
@@ -42,6 +51,61 @@ for e in "${EXCLUIR[@]}"; do OPC_EXCLUIR+=(--exclude="$e"); done
 
 paso() { echo "[$(date +%H:%M:%S)] $*"; }
 
+# Imagen limpia: quita lo personal de la copia montada en $1 (la tarjeta original no se toca)
+quitar_lo_personal() {
+    local R=$1 HASH
+    paso "Quitando lo personal (wifi, Bluetooth, SSH, PIN, historiales)"
+    rm -rf "$R/home/paolo/.local/state/minitv" "$R/home/paolo/.config/minitv" "$R/home/paolo/.cache" \
+           "$R/home/paolo/.bash_history" "$R/root/.bash_history" "$R/home/paolo/.ssh/known_hosts" \
+           "$R/home/paolo/.lesshst" "$R/home/paolo/.python_history" "$R/home/paolo/compilar/capturas"*
+    rm -f "$R"/home/paolo/compilar/*.log
+    [ -f "$R/home/paolo/.ssh/authorized_keys" ] && : > "$R/home/paolo/.ssh/authorized_keys"
+    # wifi: solo la cabecera (país); sin redes -> al encender crea su red "MiniTV"
+    grep -E '^(ctrl_interface|update_config|country)=' /etc/wpa_supplicant/wpa_supplicant.conf \
+        > "$R/etc/wpa_supplicant/wpa_supplicant.conf"
+    chmod 600 "$R/etc/wpa_supplicant/wpa_supplicant.conf"
+    rm -f "$R/etc/wpa_supplicant/wpa_supplicant.conf.bak-minitv"
+    rm -rf "$R"/var/lib/bluetooth/*
+    rm -f "$R"/etc/ssh/ssh_host_*
+    rm -rf "$R"/var/log/journal/*
+    rm -f "$R"/var/log/*.gz "$R"/var/log/*.[0-9]
+    find "$R/var/log" -type f -exec truncate -s 0 {} +
+    : > "$R/etc/machine-id"
+    rm -f "$R/var/lib/dbus/machine-id"
+    # clave del usuario paolo = "minitv", vencida (pide una nueva al entrar por SSH)
+    HASH=$(openssl passwd -6 minitv)
+    awk -F: -v OFS=: -v h="$HASH" '$1 == "paolo" { $2 = h; $3 = 0 } { print }' "$R/etc/shadow" > "$R/etc/shadow.nuevo"
+    cat "$R/etc/shadow.nuevo" > "$R/etc/shadow"
+    rm -f "$R/etc/shadow.nuevo"
+    # primer arranque: claves SSH nuevas y clave nueva para su red propia (antes de minitv-red)
+    cat > "$R/usr/local/sbin/minitv-primer-arranque" <<'EOF'
+#!/bin/sh
+# Primer arranque de una MiniTV nueva (imagen limpia): claves propias. Se ejecuta una vez.
+# El PIN de Administrar lo crea solo minitv-remoto (no hay ~/.config/minitv/admin.json).
+ssh-keygen -A
+CLAVE="minitv$(od -An -N2 -tu2 /dev/urandom | tr -d ' ' | cut -c1-4)"
+sed -i "s/^CLAVE=.*/CLAVE=$CLAVE/" /etc/minitv/red-propia.conf
+systemctl disable minitv-primer-arranque.service
+EOF
+    chmod 755 "$R/usr/local/sbin/minitv-primer-arranque"
+    cat > "$R/etc/systemd/system/minitv-primer-arranque.service" <<'EOF'
+[Unit]
+Description=MiniTV: claves propias en el primer arranque de una MiniTV nueva
+DefaultDependencies=no
+After=local-fs.target
+Before=minitv-red.service ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/minitv-primer-arranque
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ln -sf /etc/systemd/system/minitv-primer-arranque.service \
+        "$R/etc/systemd/system/multi-user.target.wants/minitv-primer-arranque.service"
+}
+
 limpiar() {
     set +e
     mountpoint -q "$MNT/boot" && umount "$MNT/boot"
@@ -54,7 +118,7 @@ trap limpiar EXIT
 
 mkdir -p "$DEST" "$MNT"
 chown paolo:paolo "$DEST"                    # la Mac borra aquí la copia temporal al descargarla
-rm -f "$DEST"/minitv-sistema-*.img "$DEST"/minitv-sistema-*.img.gz.tmp
+rm -f "$DEST"/minitv-*.img "$DEST"/minitv-*.img.gz.tmp
 
 paso "Deteniendo la MiniTV mientras se copia"
 systemctl stop minitv
@@ -128,6 +192,9 @@ ExecStart=/usr/local/sbin/minitv-expandir
 WantedBy=multi-user.target
 EOF
 ln -sf /etc/systemd/system/minitv-expandir.service "$MNT/etc/systemd/system/multi-user.target.wants/minitv-expandir.service"
+
+# ----- Imagen limpia (para otra MiniTV): fuera todo lo personal -----
+[ "$LIMPIA" = si ] && quitar_lo_personal "$MNT"
 
 # ----- Comprobar y comprimir -----
 sync

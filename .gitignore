@@ -11,3 +11,6 @@ lista-oro.txt
 # Logos de canales (marcas registradas: solo viven en la TV, ~/videos/logos)
 pi/logos/
 .DS_Store
+
+# Copias de trabajo de Claude Code
+.claude/
